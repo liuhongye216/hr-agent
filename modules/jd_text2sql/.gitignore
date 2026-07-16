@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+!.env.example
+.codex_tmp/
+.browser_profile/
+.cdp_profile/
+runtime/
+tools/collector/data/
+tools/collector/.venv/
+tools/collector/.cdp_profile/
+*.log
