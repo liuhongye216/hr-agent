@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic import ValidationError
 
 from .config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, is_valid_api_key
-from .schemas import StructuredCommand
+from .schemas import JobFields, Phase, SemanticFact, StructuredCommand
 from .semantics import reconcile_command_semantics
 
 
 SYSTEM_PROMPT = """你是公司侧招聘岗位管理助手，只把用户文本转换为结构化命令，绝不执行 CSV/SQL/文件操作。
 intent 只能是 create/update/delete/search/confirm/cancel/unknown。处理岗位内容时必须先拆成每句只含一个语义的原子句，再逐句生成 semantic_facts，最后投影业务字段。
+
+路由约束：包含“我要招、想招、招聘、招一个、招一名、新建岗位、发布岗位”时优先判定 create；正式工、实习生、兼职、合同工只表示用工类型。只有用户明确说修改、更新、删除、查询或查找已有岗位时，才能进入相应流程。上下文处于 CREATING 时，普通补充默认延续当前草稿，不能改判成查询或修改已有岗位。
 
 语义定义：
 - responsibility（岗位职责）：员工入职后要执行的动作、承担的任务或交付的结果。常见动词：负责、完成、搭建、制定、推进、交付、参与、建设、训练、评估。
@@ -38,7 +41,104 @@ intent 只能是 create/update/delete/search/confirm/cancel/unknown。处理岗�
 
 当只明确给出“从0开始预训练大模型”一类职责时，职责保持 explicit；可以给出 Python、深度学习框架、Transformer、数据处理、分布式训练等少量 inferred 技能建议，并生成高信息量 clarification_questions，询问“从0”含义、负责环节、技能必需性及是否要求既有大规模/分布式训练经验。建议绝不进入正式 JSON 字段。
 
+改写约束：去掉“我要、我们想、这个岗位是”等口语前缀，把职责整理为动作表达，把模糊能力表达忠实规范化；不得新增用户未确认的学历、年限、证书、数值、技术或“熟练、精通、必须、独立负责”等强度。用户只说“懂 LLM”时可写成“具备大语言模型（LLM）相关基础知识”，不得补成 Python、PyTorch、分布式训练、SFT、RLHF 或 DPO。
+
 普通字段约定：title 岗位名；company_name 公司名；city 城市；work_address 详细地址；salary_min/salary_max 换算成人民币数值（20k-30k/月 => 20000,30000,CNY,month）；education_min_level 不限=0、初中=1、高中/中专=2、大专=3、本科=4、硕士=5、博士=6；experience_*_months 使用月。用户明确清空字段时写 clear_fields。修改/删除的定位文字写 search_query，仅把真正变更写 fields。不得生成 job_id、content_hash、scraped_at、extraction_mode。未明确的信息保持 null 或空数组。"""
+
+
+_CREATE_RE = re.compile(
+    r"^(?:我要招|我想招(?:聘)?|想招聘?|帮我招|招聘|招一个|招一名|新建(?:一个)?|发布岗位)"
+)
+_UPDATE_RE = re.compile(r"(?:修改|更新|调整(?:一下)?(?:已有)?岗位|编辑)")
+_DELETE_RE = re.compile(r"(?:删除|取消岗位|下架岗位)")
+_SEARCH_RE = re.compile(r"(?:查询|查一下|查找|搜索|有哪些岗位|找一下)")
+_COMPANY_RE = re.compile(
+    r"([\u4e00-\u9fffA-Za-z0-9（）()·]{2,40}?(?:有限责任公司|股份有限公司|有限公司|公司))"
+)
+_EMPLOYMENT = (
+    (re.compile(r"(?:正式工|全职)"), "full_time"),
+    (re.compile(r"(?:实习生|实习岗位|实习)"), "internship"),
+    (re.compile(r"兼职"), "part_time"),
+    (re.compile(r"(?:合同工|合同制)"), "contract"),
+)
+
+
+def _employment_fields(text: str) -> dict[str, Any]:
+    for pattern, value in _EMPLOYMENT:
+        if pattern.search(text):
+            fields: dict[str, Any] = {"employment": value}
+            if value == "internship":
+                fields["recruitment"] = "internship"
+            return fields
+    return {}
+
+
+def _create_title(text: str) -> str | None:
+    candidate = re.sub(
+        r"^.*?(?:我要招|我想招(?:聘)?|想招聘?|帮我招|招聘|招一个|招一名|新建(?:一个)?|发布)(?:一个|一名)?",
+        "", text.strip(), count=1,
+    ).strip(" ，,。.!！")
+    candidate = re.sub(r"岗位$", "", candidate).strip()
+    if not candidate or candidate in {"正式工", "全职", "实习生", "实习", "兼职", "合同工"}:
+        return None
+    return candidate
+
+
+def _locating_query(text: str) -> str:
+    query = re.sub(
+        r"^(?:请)?(?:帮我)?(?:修改|更新|编辑|删除|查询|查一下|查找|搜索|找一下)", "", text.strip(), count=1,
+    )
+    return query.strip(" 的，,。.!！") or text.strip()
+
+
+def deterministic_command(text: str, phase: str | Phase = Phase.IDLE.value) -> StructuredCommand | None:
+    """Handle high-confidence routing/extraction before asking an LLM.
+
+    Returning ``None`` means the text still needs general language understanding.
+    """
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return None
+    employment = _employment_fields(cleaned)
+
+    # Explicit existing-position operations take precedence, but employment words alone never do.
+    if _DELETE_RE.search(cleaned):
+        return StructuredCommand(intent="delete", search_query=_locating_query(cleaned))
+    if _UPDATE_RE.search(cleaned):
+        return StructuredCommand(intent="update", search_query=_locating_query(cleaned))
+    if _SEARCH_RE.search(cleaned):
+        return StructuredCommand(intent="search", search_query=_locating_query(cleaned))
+    if _CREATE_RE.search(cleaned):
+        title = _create_title(cleaned)
+        if title:
+            employment["title"] = title
+        return StructuredCommand(intent="create", fields=JobFields.model_validate(employment))
+
+    if str(phase) == Phase.CREATING.value:
+        company_match = _COMPANY_RE.search(cleaned)
+        fields = dict(employment)
+        facts: list[SemanticFact] = []
+        if company_match:
+            fields["company_name"] = company_match.group(1)
+            remainder = (cleaned[:company_match.start()] + " " + cleaned[company_match.end():]).strip(" ，,。.!！")
+            # A short plain remainder is the position title, not a request to search existing data.
+            if remainder and not re.search(r"[，,。；;：:]|(?:负责|要求|技能|训练|熟悉|具备|会用|懂)", remainder):
+                fields["title"] = remainder.strip()
+        if "后训练是训练一个招聘模型" in cleaned:
+            facts.append(SemanticFact(
+                value="后训练是训练一个招聘模型", category="responsibility", importance="neutral",
+                source_type="explicit", evidence_text="后训练是训练一个招聘模型",
+            ))
+        if re.search(r"(?:技能(?:主要)?是)?懂\s*llm", cleaned, re.IGNORECASE):
+            facts.append(SemanticFact(
+                value="懂llm", category="requirement", importance="must",
+                source_type="explicit", evidence_text="懂llm",
+            ))
+        if fields or facts:
+            return StructuredCommand(
+                intent="update", fields=JobFields.model_validate(fields), semantic_facts=facts,
+            )
+    return None
 
 
 class LLMConfigurationError(RuntimeError):

@@ -11,7 +11,7 @@ from .agent import AgentState, JobCsvAgent, initial_state
 from .factory import create_default_agent
 from .config import BUSINESS_CSV, DEEPSEEK_MODEL, is_valid_api_key
 from .llm import LLMConfigurationError, LLMServiceError
-from .schemas import ChatRequest, ChatResponse, Phase
+from .schemas import FIELD_LABELS, ChatRequest, ChatResponse, Phase
 
 
 class InMemorySessionStore:
@@ -42,9 +42,11 @@ def _response(session_id: str, state: AgentState) -> ChatResponse:
         session_id=session_id,
         phase=Phase(state.get("phase", Phase.IDLE.value)),
         message=state.get("message", ""),
-        missing_fields=state.get("missing_fields", []),
+        missing_fields=[
+            FIELD_LABELS.get(field, field) for field in state.get("missing_fields", [])
+        ],
         candidates=[
-            {key: str(row.get(key, "")) for key in ("job_id", "company_name", "title", "city")}
+            {key: str(row.get(key, "")) for key in ("company_name", "title", "city")}
             for row in state.get("candidates", [])
         ],
         can_confirm=state.get("can_confirm", False),
@@ -82,7 +84,15 @@ def create_app(agent: JobCsvAgent | None = None) -> FastAPI:
         except LLMServiceError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except (ValueError, RuntimeError, OSError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            detail = str(exc)
+            internal_terms = (
+                "job_id", "requirements_json", "responsibilities_json", "skills_json",
+                "schema", "extraction_mode",
+            )
+            if any(term in detail.casefold() for term in internal_terms):
+                logging.getLogger(__name__).warning("Job validation failed: %s", detail)
+                detail = "岗位信息校验未通过，请检查已填写的内容后重试。"
+            raise HTTPException(status_code=422, detail=detail) from exc
         except Exception as exc:
             logging.getLogger(__name__).exception("Unhandled job CSV agent error")
             raise HTTPException(status_code=500, detail="后端发生未预期错误，请查看 FastAPI 日志。") from exc

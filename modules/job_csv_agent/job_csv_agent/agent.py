@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from .jd_text2sql_adapter import JDText2SQLAdapter
+from .llm import deterministic_command
 from .schemas import (
     CREATE_CONTENT_FIELDS, FIELD_LABELS, JSON_FIELDS, REQUIRED_CREATE_FIELDS, JobFields, Phase,
     SemanticFact, StructuredCommand,
@@ -25,6 +27,11 @@ class AgentState(TypedDict, total=False):
     draft: dict[str, Any]
     semantic_facts: list[dict[str, Any]]
     clarification_questions: list[str]
+    unanswered_questions: list[str]
+    asked_questions: list[str]
+    pending_suggestions: list[str]
+    missing_important_fields: list[str]
+    incomplete_warning_acknowledged: bool
     target_id: str | None
     candidates: list[dict[str, str]]
     pending_action: str | None
@@ -43,6 +50,11 @@ def initial_state() -> AgentState:
         "draft": {},
         "semantic_facts": [],
         "clarification_questions": [],
+        "unanswered_questions": [],
+        "asked_questions": [],
+        "pending_suggestions": [],
+        "missing_important_fields": [],
+        "incomplete_warning_acknowledged": False,
         "target_id": None,
         "candidates": [],
         "pending_action": None,
@@ -76,12 +88,21 @@ def _display_value(field: str, value: Any) -> str:
             pass
     if isinstance(value, list):
         return "、".join(str(item) for item in value) or "（空列表）"
+    friendly_values = {
+        "full_time": "全职", "part_time": "兼职", "full_or_part_time": "全职或兼职",
+        "internship": "实习", "contract": "合同制", "temporary": "临时用工",
+        "onsite": "现场办公", "remote": "远程办公", "hybrid": "混合办公",
+        "campus": "校园招聘", "experienced": "社会招聘", "mixed": "不限",
+        "month": "月", "year": "年", "day": "日", "hour": "小时", "per_order": "单",
+    }
+    if isinstance(value, str) and value in friendly_values:
+        return friendly_values[value]
     return str(value)
 
 
 def _field_lines(fields: dict[str, Any]) -> str:
     if not fields:
-        return "（本轮未识别到字段）"
+        return "（本轮没有新增信息）"
     return "\n".join(
         f"- {FIELD_LABELS.get(key, key)}：{_display_value(key, value)}" for key, value in fields.items()
     )
@@ -109,12 +130,66 @@ def _semantic_notes(facts: list[dict[str, Any]], questions: list[str]) -> str:
     inferred = [item["value"] for item in facts if item.get("source_type") == "inferred"]
     sections: list[str] = []
     if unknown:
-        sections.append("⚠️ 待澄清（不会写入 CSV）：" + "、".join(unknown))
+        sections.append("仍需您确认：" + "、".join(unknown))
     if inferred:
-        sections.append("💡 待确认能力建议（inferred，不会写入 CSV）：" + "、".join(inferred))
+        sections.append("建议补充（确认前不会保存）：\n" + "\n".join(f"- {item}" for item in inferred))
     if questions:
-        sections.append("建议确认：\n" + "\n".join(f"- {item}" for item in questions))
+        sections.append("接下来可优先确认：\n" + "\n".join(f"- {item}" for item in questions[:3]))
     return "\n\n" + "\n\n".join(sections) if sections else ""
+
+
+def _important_missing(draft: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    checks = (
+        ("responsibilities_json", "岗位职责"),
+        ("requirements_json", "任职要求"),
+        ("skills_json", "技能要求"),
+        ("city", "工作城市"),
+        ("work_mode", "办公模式"),
+        ("employment", "用工类型"),
+        ("education_min_level", "学历要求"),
+    )
+    for field, label in checks:
+        if not draft.get(field):
+            missing.append(label)
+    if not draft.get("salary_min") and not draft.get("salary_max"):
+        missing.append("薪资范围")
+    if not draft.get("experience_min_months") and not draft.get("experience_max_months"):
+        missing.append("经验要求")
+    if draft.get("employment") == "internship" or draft.get("recruitment") == "internship":
+        missing.append("实习时长与每周出勤要求")
+    return missing
+
+
+def _priority_questions(draft: dict[str, Any], suggestions: list[str]) -> list[str]:
+    questions: list[str] = []
+    if not draft.get("company_name") and not draft.get("title"):
+        questions.append("请补充公司名称和岗位名称。")
+    elif not draft.get("company_name"):
+        questions.append("请补充公司名称。")
+    elif not draft.get("title"):
+        questions.append("请补充岗位名称。")
+    if not any(draft.get(field) for field in CREATE_CONTENT_FIELDS):
+        questions.append("请补充主要工作内容或任职要求。")
+    questions.extend(suggestions)
+    return list(dict.fromkeys(questions))
+
+
+def _question_is_answered(question: str, draft: dict[str, Any], user_input: str) -> bool:
+    if "公司名称" in question and draft.get("company_name"):
+        if "岗位名称" not in question or draft.get("title"):
+            return True
+    if "岗位名称" in question and draft.get("title") and "公司名称" not in question:
+        return True
+    if ("工作内容" in question or "任职要求" in question) and any(
+        draft.get(field) for field in CREATE_CONTENT_FIELDS
+    ):
+        return True
+    if "后训练范围" in question and re.search(r"SFT|RLHF|DPO|奖励模型|模型评估|其他", user_input, re.IGNORECASE):
+        return True
+    if "Python" in question and re.search(r"Python|PyTorch|分布式", user_input, re.IGNORECASE):
+        return True
+    return False
 
 
 class JobCsvAgent:
@@ -168,6 +243,9 @@ class JobCsvAgent:
             return StructuredCommand(intent="update")
         if normalized.isdigit():
             return StructuredCommand(intent="unknown", selection_index=int(normalized))
+        deterministic = deterministic_command(text, state.get("phase", Phase.IDLE.value))
+        if deterministic is not None:
+            return reconcile_command_semantics(deterministic, text)
         context = {
             "phase": state.get("phase"),
             "draft": state.get("draft", {}),
@@ -175,7 +253,12 @@ class JobCsvAgent:
             "candidate_count": len(state.get("candidates", [])),
             "pending_action": state.get("pending_action"),
         }
-        return reconcile_command_semantics(self.interpreter.extract(text, context), text)
+        command = reconcile_command_semantics(self.interpreter.extract(text, context), text)
+        if state.get("phase") == Phase.CREATING.value:
+            # An active creation draft owns ordinary follow-up text. Only the explicit
+            # deterministic operation patterns above may switch to an existing-position flow.
+            command = command.model_copy(update={"intent": "update", "search_query": None})
+        return command
 
     @staticmethod
     def _missing(draft: dict[str, Any]) -> list[str]:
@@ -190,27 +273,61 @@ class JobCsvAgent:
         changed: dict[str, Any],
         semantic_facts: list[dict[str, Any]],
         clarification_questions: list[str],
+        previous_state: AgentState | None = None,
+        user_input: str = "",
     ) -> AgentState:
+        previous_state = previous_state or initial_state()
         missing = self._missing(draft)
-        recognized = f"本轮识别到的字段：\n{_field_lines(changed)}"
-        notes = _semantic_notes(semantic_facts, clarification_questions)
+        important_missing = _important_missing(draft)
+        all_questions = _priority_questions(draft, clarification_questions)
+        unresolved = [
+            question for question in dict.fromkeys([
+                *previous_state.get("unanswered_questions", []), *all_questions,
+            ])
+            if not _question_is_answered(question, draft, user_input)
+        ]
+        asked = list(previous_state.get("asked_questions", []))
+        display_questions = [question for question in unresolved if question not in asked][:3]
+        asked = list(dict.fromkeys([*asked, *display_questions]))
+        suggestions = [
+            item["value"] for item in semantic_facts if item.get("source_type") == "inferred"
+        ]
+        recognized = f"本轮整理出的岗位信息：\n{_field_lines(changed)}"
+        notes = _semantic_notes(semantic_facts, display_questions)
+        question_state = {
+            "clarification_questions": clarification_questions,
+            "unanswered_questions": unresolved,
+            "asked_questions": asked,
+            "pending_suggestions": suggestions,
+            "missing_important_fields": important_missing,
+            "incomplete_warning_acknowledged": False,
+        }
         if missing:
             labels = "、".join(FIELD_LABELS.get(field, field) for field in missing)
             return {
                 **_clean_turn(), "phase": Phase.CREATING.value, "draft": draft,
                 "semantic_facts": semantic_facts,
-                "clarification_questions": clarification_questions,
+                **question_state,
                 "missing_fields": missing, "can_confirm": False, "can_cancel": True,
-                "message": f"{recognized}{notes}\n\n当前还缺少必填字段：{labels}。请继续补充。",
+                "message": f"{recognized}{notes}\n\n要生成岗位，当前还需要：{labels}。",
             }
+        missing_section = (
+            "\n\n仍未填写的重要信息：\n"
+            + "\n".join(f"- {item}" for item in important_missing)
+            + "\n\n您可以继续补充，也可以按当前内容保存；保存前我会再提醒一次。"
+            if important_missing else ""
+        )
         return {
             **_clean_turn(), "phase": Phase.CONFIRMING.value, "draft": draft,
             "pending_action": "create", "pending_fields": draft, "pending_clear_fields": [],
             "semantic_facts": semantic_facts,
-            "clarification_questions": clarification_questions,
+            **question_state,
             "pending_semantic_facts": semantic_facts,
             "missing_fields": [], "can_confirm": True, "can_cancel": True,
-            "message": f"{recognized}\n\n📝 请确认新建岗位：\n{_field_lines(draft)}{notes}",
+            "message": (
+                f"{recognized}\n\n已整理的岗位信息：\n{_field_lines(draft)}"
+                f"{notes}{missing_section}"
+            ),
         }
 
     def _idle(self, state: AgentState) -> AgentState:
@@ -218,27 +335,45 @@ class JobCsvAgent:
         fields = command.fields.model_dump(exclude_none=True)
         if command.intent == "create":
             facts = _merge_facts([], command.semantic_facts)
-            return self._creation_result(fields, fields, facts, command.clarification_questions)
+            return self._creation_result(
+                fields, fields, facts, command.clarification_questions, state,
+                state.get("user_input", ""),
+            )
         if command.intent in {"update", "delete"}:
             return self._locate_for_edit(command)
         if command.intent == "search":
-            if self.query_adapter is None:
-                return {**_clean_turn(), "message": "当前未配置 jd_text2sql 查询适配器。"}
-            result = self.query_adapter.ask(state.get("user_input", ""))
-            if result.get("needs_clarification"):
-                return {**_clean_turn(), "message": result.get("message") or "请补充查询条件。"}
-            rows = result.get("rows", [])
-            body = json.dumps(rows, ensure_ascii=False, indent=2, default=str)
-            return {**_clean_turn(), "message": f"查询结果（{len(rows)} 条）：\n```json\n{body}\n```"}
+            return self._run_search(state.get("user_input", ""))
         return {
             **_clean_turn(),
-            "message": "我还不能确定您的意图。请明确说“新建岗位”“修改岗位”“删除岗位”或提出岗位查询。",
+            "message": "我还不能确定您想进行哪项操作。请明确说“新建岗位”“修改岗位”“删除岗位”或提出岗位查询。",
         }
+
+    def _run_search(self, text: str) -> AgentState:
+        if self.query_adapter is None:
+            return {**_clean_turn(), "message": "岗位查询暂时不可用，请稍后再试。"}
+        result = self.query_adapter.ask(text)
+        if result.get("needs_clarification"):
+            return {**_clean_turn(), "message": result.get("message") or "请补充想查找的公司或岗位。"}
+        rows = result.get("rows", [])
+        if not rows:
+            return {**_clean_turn(), "message": "没有找到对应岗位，请检查公司名称或岗位名称是否准确。"}
+        sections: list[str] = []
+        for index, row in enumerate(rows, 1):
+            visible = {
+                key: value for key, value in row.items()
+                if key in FIELD_LABELS and key not in {"job_id"} and value not in (None, "", [], "[]")
+            }
+            sections.append(f"{index}.\n{_field_lines(visible)}")
+        return {**_clean_turn(), "message": f"找到 {len(rows)} 个岗位：\n\n" + "\n\n".join(sections)}
 
     def _creating(self, state: AgentState) -> AgentState:
         command = self._command(state)
         if command.intent == "cancel":
-            return _reset("已取消新建，未写入 CSV。")
+            return _reset("已取消新建，内容未保存。")
+        if command.intent == "search":
+            return self._run_search(state.get("user_input", ""))
+        if command.intent in {"update", "delete"} and command.search_query:
+            return self._locate_for_edit(command)
         changed = command.fields.model_dump(exclude_none=True)
         draft = dict(state.get("draft", {}))
         draft.update(changed)
@@ -248,7 +383,9 @@ class JobCsvAgent:
         questions = list(dict.fromkeys([
             *state.get("clarification_questions", []), *command.clarification_questions,
         ]))
-        return self._creation_result(draft, changed, facts, questions)
+        return self._creation_result(
+            draft, changed, facts, questions, state, state.get("user_input", ""),
+        )
 
     def _locate_for_edit(self, command: StructuredCommand) -> AgentState:
         fields = command.fields.model_dump(exclude_none=True)
@@ -256,15 +393,16 @@ class JobCsvAgent:
         if not query:
             query = " ".join(str(fields.get(key, "")) for key in ("company_name", "title")).strip()
         if not query:
+            action_text = "删除" if command.intent == "delete" else "修改"
             return {
                 **_clean_turn(), "phase": Phase.EDITING.value, "can_cancel": True,
-                "message": "请提供要操作的公司名、岗位名或 job_id。",
+                "message": f"请告诉我您想{action_text}的是哪家公司、哪个岗位。",
             }
         candidates = self.repository.search(query)
         if not candidates:
             return {
                 **_clean_turn(), "phase": Phase.EDITING.value, "can_cancel": True,
-                "message": f"没有找到与“{query}”匹配的岗位，请换一个公司名、岗位名或 job_id。",
+                "message": "没有找到对应岗位，请检查公司名称或岗位名称是否准确。",
             }
         pending = {
             "pending_action": "delete" if command.intent == "delete" else "update",
@@ -277,7 +415,7 @@ class JobCsvAgent:
         if len(candidates) == 1:
             return self._selected(candidates[0], pending)
         lines = "\n".join(
-            f"[{index}] {row['company_name']} - {row['title']} (ID: {row['job_id']})"
+            f"[{index}] {row['company_name']} - {row['title']}"
             for index, row in enumerate(candidates, 1)
         )
         return {
@@ -301,8 +439,8 @@ class JobCsvAgent:
             return {
                 **base, "phase": Phase.CONFIRMING.value, "can_confirm": True,
                 "message": (
-                    "📝 请确认删除以下岗位（此最小实现执行物理删除）：\n"
-                    f"- {row['company_name']} - {row['title']} (ID: {row['job_id']})"
+                    "请确认删除以下岗位：\n"
+                    f"- {row['company_name']} - {row['title']}"
                 ),
             }
         if not fields and not clear_fields:
@@ -329,7 +467,7 @@ class JobCsvAgent:
             "pending_clear_fields": clear_fields, "can_confirm": True, "can_cancel": True,
             "pending_semantic_facts": semantic_facts or [],
             "message": (
-                f"📝 请确认修改：{row['company_name']} - {row['title']} (ID: {row['job_id']})\n"
+                f"请确认修改：{row['company_name']} - {row['title']}\n"
                 + "\n".join(lines)
             ),
         }
@@ -337,7 +475,7 @@ class JobCsvAgent:
     def _editing(self, state: AgentState) -> AgentState:
         command = self._command(state)
         if command.intent == "cancel":
-            return _reset("已取消修改，未写入 CSV。")
+            return _reset("已取消修改，内容未保存。")
         candidates = state.get("candidates", [])
         if candidates:
             index = command.selection_index
@@ -361,7 +499,7 @@ class JobCsvAgent:
             })
         changed = command.fields.model_dump(exclude_none=True)
         if not changed and not command.clear_fields:
-            return {**_clean_turn(), "message": "没有识别到要修改的字段，请再具体描述一次。"}
+            return {**_clean_turn(), "message": "没有识别到要修改的内容，请再具体描述一次。"}
         fields = dict(state.get("pending_fields", {})) if state.get("pending_action") == "update" else {}
         fields.update(changed)
         clears = (
@@ -378,33 +516,45 @@ class JobCsvAgent:
     def _confirming(self, state: AgentState) -> AgentState:
         command = self._command(state)
         if command.intent == "cancel":
-            return _reset("已取消操作，CSV 未发生变化。")
+            return _reset("已取消操作，内容未保存。")
         action = state.get("pending_action")
         if command.intent == "confirm":
+            important_missing = state.get("missing_important_fields", [])
+            if action == "create" and important_missing and not state.get("incomplete_warning_acknowledged"):
+                labels = "、".join(important_missing)
+                return {
+                    **state, **_clean_turn(), "phase": Phase.CONFIRMING.value,
+                    "incomplete_warning_acknowledged": True,
+                    "can_confirm": True, "can_cancel": True,
+                    "message": (
+                        f"保存前提醒：以下重要信息仍未填写：{labels}。\n\n"
+                        "如果确定按当前内容保存，请再次确认；也可以继续补充。"
+                    ),
+                }
             if action == "create":
                 row = self.repository.create(
                     state.get("pending_fields", {}),
                     persisted_semantic_facts(state.get("pending_semantic_facts", [])),
                 )
-                message = f"已写入新岗位：{row['company_name']} - {row['title']} (ID: {row['job_id']})。"
+                message = f"已保存新岗位：{row['company_name']} - {row['title']}。"
             elif action == "update":
                 _, row = self.repository.update(
                     state.get("target_id") or "", state.get("pending_fields", {}),
                     state.get("pending_clear_fields", []),
                     persisted_semantic_facts(state.get("pending_semantic_facts", [])),
                 )
-                message = f"已更新岗位：{row['company_name']} - {row['title']} (ID: {row['job_id']})。"
+                message = f"已更新岗位：{row['company_name']} - {row['title']}。"
             elif action == "delete":
                 row = self.repository.delete(state.get("target_id") or "")
-                message = f"已删除岗位：{row['company_name']} - {row['title']} (ID: {row['job_id']})。"
+                message = f"已删除岗位：{row['company_name']} - {row['title']}。"
             else:
                 return _reset("没有待确认的操作。")
             if self.query_adapter is not None:
                 try:
-                    counts = self.query_adapter.rebuild()
-                    message += f" jd_text2sql 查询库已同步（{counts['jobs']} 条）。"
-                except Exception as exc:  # CSV commit succeeded; never invite a duplicate retry.
-                    message += f" 但查询库同步失败：{exc}。请稍后执行 `python -m jd_text2sql build-db`。"
+                    self.query_adapter.rebuild()
+                    message += " 岗位查询数据已同步。"
+                except Exception:  # The save succeeded; never invite a duplicate retry.
+                    message += " 岗位已保存，但查询服务暂时未同步，请联系管理员。"
             return _reset(message)
         if command.intent == "update":
             changed = command.fields.model_dump(exclude_none=True)
@@ -415,6 +565,11 @@ class JobCsvAgent:
                     "draft": state.get("pending_fields", {}) if action == "create" else state.get("draft", {}),
                     "semantic_facts": state.get("pending_semantic_facts", []),
                     "clarification_questions": state.get("clarification_questions", []),
+                    "unanswered_questions": state.get("unanswered_questions", []),
+                    "asked_questions": state.get("asked_questions", []),
+                    "pending_suggestions": state.get("pending_suggestions", []),
+                    "missing_important_fields": state.get("missing_important_fields", []),
+                    "incomplete_warning_acknowledged": False,
                     "can_confirm": False, "message": "好的，请继续告诉我要调整哪些字段。",
                 }
             if action == "create":
@@ -426,7 +581,9 @@ class JobCsvAgent:
                 questions = list(dict.fromkeys([
                     *state.get("clarification_questions", []), *command.clarification_questions,
                 ]))
-                return self._creation_result(draft, changed, facts, questions)
+                return self._creation_result(
+                    draft, changed, facts, questions, state, state.get("user_input", ""),
+                )
             if action == "update":
                 fields = dict(state.get("pending_fields", {}))
                 fields.update(changed)

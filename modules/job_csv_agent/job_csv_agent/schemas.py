@@ -25,14 +25,14 @@ REQUIRED_CREATE_FIELDS = ("company_name", "title")
 CREATE_CONTENT_FIELDS = ("requirements_json", "responsibilities_json")
 
 FIELD_LABELS = {
-    "job_id": "岗位 ID", "title": "岗位名称", "company_name": "公司名称",
+    "job_id": "岗位编号", "title": "岗位名称", "company_name": "公司名称",
     "city": "城市", "work_address": "工作地址", "salary_min": "最低薪资",
     "salary_max": "最高薪资", "salary_currency": "薪资币种",
     "salary_period": "薪资周期", "recruitment": "招聘类型",
     "employment": "用工类型", "work_mode": "办公模式",
     "education_min_level": "最低学历等级", "experience_min_months": "最低经验（月）",
     "experience_max_months": "最高经验（月）", "requirements_json": "任职要求",
-    "responsibilities_json": "岗位职责", "skills_json": "技能",
+    "responsibilities_json": "岗位职责", "skills_json": "技能要求",
     "certificates_json": "证书", "benefits_json": "福利", "source_url": "来源链接",
     "job_content": "任职要求、岗位职责或完整 JD 文本",
 }
@@ -132,6 +132,26 @@ class SemanticFact(BaseModel):
         if self.source_type == "inferred" or self.category == "unknown":
             self.needs_confirmation = True
         return self
+
+
+class RewriteResult(BaseModel):
+    """Internal safety decision for one piece of JD copy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    original_text: str = Field(min_length=1)
+    rewritten_text: str = Field(min_length=1)
+    category: Literal["responsibility", "requirement", "skill", "benefit", "unknown"]
+    source_type: Literal["explicit", "inferred", "user_confirmed"]
+    evidence_level: Literal["direct", "contextual", "none"]
+    confidence: float = Field(ge=0, le=1)
+    decision: Literal["safe_rewrite", "needs_confirmation", "reject_or_clarify"]
+    reason: str = Field(min_length=1)
+
+    @field_validator("original_text", "rewritten_text", "reason")
+    @classmethod
+    def clean_rewrite_text(cls, value: str) -> str:
+        return " ".join(value.split())
 
 class StructuredCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")

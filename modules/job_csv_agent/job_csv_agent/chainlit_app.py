@@ -30,8 +30,8 @@ async def _render(payload: dict[str, Any]) -> None:
     actions: list[cl.Action] = []
     if payload.get("can_confirm"):
         actions.extend([
-            cl.Action(name="confirm_write", label="确认写入", payload={"value": "confirm"}),
-            cl.Action(name="continue_edit", label="继续修改", payload={"value": "edit"}),
+            cl.Action(name="confirm_write", label="按当前内容保存", payload={"value": "confirm"}),
+            cl.Action(name="continue_edit", label="继续补充", payload={"value": "edit"}),
         ])
     if payload.get("can_cancel"):
         actions.append(cl.Action(name="cancel_operation", label="取消", payload={"value": "cancel"}))

@@ -20,6 +20,10 @@ class FakeInterpreter:
                 "company_name": "API 示例公司", "title": "测试工程师",
                 "requirements_json": ["熟悉自动化测试"],
             },
+            "semantic_facts": [{
+                "value": "熟悉自动化测试", "category": "requirement", "importance": "must",
+                "source_type": "explicit", "evidence_text": "熟悉自动化测试",
+            }],
         })
 
 
@@ -35,11 +39,13 @@ def test_fastapi_session_confirmation_flow(tmp_path: Path) -> None:
         session_id = created.json()["session_id"]
 
         preview = client.post(
-            f"/sessions/{session_id}/messages", json={"content": "新建测试岗位"},
+            f"/sessions/{session_id}/messages", json={"content": "创建测试岗位，熟悉自动化测试"},
         )
         assert preview.json()["phase"] == "CONFIRMING"
         assert len(CsvJobRepository(csv_path).search("API 示例公司")) == 0
 
+        confirmed = client.post(f"/sessions/{session_id}/confirm")
+        assert confirmed.json()["phase"] == "CONFIRMING"
         confirmed = client.post(f"/sessions/{session_id}/confirm")
         assert confirmed.json()["phase"] == "IDLE"
         assert len(CsvJobRepository(csv_path).search("API 示例公司")) == 1
@@ -55,7 +61,7 @@ def test_placeholder_api_key_returns_actionable_422(tmp_path: Path, monkeypatch)
     with TestClient(app) as client:
         session_id = client.post("/sessions").json()["session_id"]
         response = client.post(
-            f"/sessions/{session_id}/messages", json={"content": "新建招聘岗位"},
+            f"/sessions/{session_id}/messages", json={"content": "帮我处理一个岗位"},
         )
 
     assert response.status_code == 422

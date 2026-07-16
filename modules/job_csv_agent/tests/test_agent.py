@@ -32,21 +32,28 @@ def test_create_requires_confirmation_before_write(tmp_path: Path) -> None:
     empty_csv(path)
     repository = CsvJobRepository(path)
     interpreter = FakeInterpreter({
-        "新建": {"intent": "create", "fields": {"title": "Python 开发", "salary_min": 20_000}},
-        "补充": {"intent": "update", "fields": {
+        "创建": {"intent": "create", "fields": {"title": "Python 开发", "salary_min": 20_000}},
+        "示例科技，三年开发经验": {"intent": "update", "fields": {
             "company_name": "示例科技", "requirements_json": ["三年开发经验"],
-        }},
+        }, "semantic_facts": [{
+            "value": "三年开发经验", "category": "requirement", "importance": "must",
+            "source_type": "explicit", "evidence_text": "三年开发经验",
+        }]},
     })
     agent = JobCsvAgent(repository, interpreter)
 
-    state = agent.handle(initial_state(), "新建")
+    state = agent.handle(initial_state(), "创建")
     assert state["phase"] == Phase.CREATING.value
     assert set(state["missing_fields"]) == {"company_name", "job_content"}
     assert row_count(path) == 0
 
-    state = agent.handle(state, "补充")
+    state = agent.handle(state, "示例科技，三年开发经验")
     assert state["phase"] == Phase.CONFIRMING.value
     assert state["can_confirm"] is True
+    assert row_count(path) == 0
+
+    state = agent.handle(state, "确认写入", {"intent": "confirm"})
+    assert state["phase"] == Phase.CONFIRMING.value
     assert row_count(path) == 0
 
     state = agent.handle(state, "确认写入", {"intent": "confirm"})
@@ -67,11 +74,16 @@ def test_edit_disambiguates_then_confirms(tmp_path: Path) -> None:
         "salary_min": 21_000,
     })
     interpreter = FakeInterpreter({
-        "修改 Python 岗位": {
-            "intent": "update", "search_query": "Python",
-            "fields": {"salary_min": 25_000, "salary_max": 30_000},
+        "薪资调整为25000到30000": {
+            "intent": "update", "fields": {"salary_min": 25_000, "salary_max": 30_000},
         },
-        "加福利": {"intent": "update", "fields": {"benefits_json": ["年度体检"]}},
+        "增加年度体检": {
+            "intent": "update", "fields": {"benefits_json": ["年度体检"]},
+            "semantic_facts": [{
+                "value": "年度体检", "category": "benefit", "importance": "neutral",
+                "source_type": "explicit", "evidence_text": "年度体检",
+            }],
+        },
     })
     agent = JobCsvAgent(repository, interpreter)
 
@@ -80,13 +92,14 @@ def test_edit_disambiguates_then_confirms(tmp_path: Path) -> None:
     assert len(state["candidates"]) == 2
 
     state = agent.handle(state, "1", {"intent": "unknown", "selection_index": 1})
-    assert state["phase"] == Phase.CONFIRMING.value
+    assert state["phase"] == Phase.EDITING.value
     selected_id = state["target_id"]
     assert repository.get(selected_id)["salary_min"] in {"20000.0", "21000.0"}
 
+    state = agent.handle(state, "薪资调整为25000到30000")
+    assert state["phase"] == Phase.CONFIRMING.value
     state = agent.handle(state, "继续修改", {"intent": "update"})
-    assert state["phase"] == Phase.EDITING.value
-    state = agent.handle(state, "加福利")
+    state = agent.handle(state, "增加年度体检")
     assert state["phase"] == Phase.CONFIRMING.value
     assert state["pending_fields"]["salary_min"] == 25_000
     assert state["pending_fields"]["benefits_json"] == ["年度体检"]
@@ -103,7 +116,7 @@ def test_create_with_responsibility_only_and_inferred_suggestions(tmp_path: Path
     empty_csv(path)
     repository = CsvJobRepository(path)
     interpreter = FakeInterpreter({
-        "新建大模型岗位": {
+        "请创建示例科技的大模型工程师，职责是从0开始预训练大模型": {
             "intent": "create",
             "fields": {
                 "company_name": "示例科技", "title": "大模型工程师",
@@ -114,17 +127,19 @@ def test_create_with_responsibility_only_and_inferred_suggestions(tmp_path: Path
     })
     agent = JobCsvAgent(repository, interpreter)
 
-    state = agent.handle(initial_state(), "新建大模型岗位")
+    state = agent.handle(initial_state(), "请创建示例科技的大模型工程师，职责是从0开始预训练大模型")
     assert state["phase"] == Phase.CONFIRMING.value
     assert state["pending_fields"].get("requirements_json") is None
-    assert state["pending_fields"]["responsibilities_json"] == ["从0开始预训练大模型"]
-    assert "inferred，不会写入 CSV" in state["message"]
+    assert state["pending_fields"]["responsibilities_json"] == ["从0开始预训练大模型。"]
+    assert "确认前不会保存" in state["message"]
     assert "从零训练基础模型" in state["message"]
     assert row_count(path) == 0
 
     state = agent.handle(state, "确认写入", {"intent": "confirm"})
+    assert state["phase"] == Phase.CONFIRMING.value
+    state = agent.handle(state, "确认写入", {"intent": "confirm"})
     assert state["phase"] == Phase.IDLE.value
     row = repository.search("示例科技 大模型工程师")[0]
     assert row["requirements_json"] == "[]"
-    assert row["responsibilities_json"] == '["从0开始预训练大模型"]'
+    assert row["responsibilities_json"] == '["从0开始预训练大模型。"]'
     assert row["skills_json"] == "[]"
