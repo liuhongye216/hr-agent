@@ -6,46 +6,45 @@ from typing import Any
 from pydantic import ValidationError
 
 from .config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, is_valid_api_key
-from .schemas import (
-    ConstrainedRewriteBatch, LLMInterpretation, Phase, SemanticFact, StructuredCommand,
-)
+from .schemas import LLMInterpretation, StructuredCommand
 
 
-SYSTEM_PROMPT = """你是公司侧招聘岗位管理助手。你的职责只是理解用户话语并输出类型化 JSON；
-绝不能读写文件、生成或执行 SQL、调用 Repository，也不能替用户确认任何写操作。
+SYSTEM_PROMPT = """你是公司侧招聘岗位管理助手。你只理解用户话语并输出类型化 JSON；不得读写文件、生成或执行 SQL，也不得替用户确认保存。
 
-每轮必须先结合 context.phase、当前草稿、待处理动作和候选数量判断路由与动作，再抽取字段。
-路由包括 job_write、job_read、task_control、help、conversation、unsupported；动作必须与 intent 一致。
-在 CREATING 中，区分五类输入：补充当前岗位、闲聊、帮助、查询已有岗位、明确发起的新任务。
-闲聊和帮助不得改变草稿；查询只读；新任务不得被当成当前岗位字段。
+每轮必须结合 context 中的 phase、完整 draft、provenance、last_assistant_question、recent_messages 和 ready_to_save。不要假装忘记已有草稿。
 
-不得用关键词删除、前后缀截取或正则猜岗位名。必须理解完整语义：
-- “我要招聘”只表示开始创建岗位，title 必须为 null；不得把“聘”当成岗位名。
-- “我要招聘算法工程师”表示创建，title 必须是完整的“算法工程师”。
-- 用户没有明确提供的字段保持 null，不得凭常识补齐。
+字段更新必须使用增量 DraftPatch：
+- set_fields 仅设置标量字段，并在 set_sources 标注 explicit/contextual/normalized。
+- append_items 向列表追加，不得返回完整列表覆盖旧值。
+- “还有、以及、另外”默认追加；“改成、不是……而是……、仅限于”使用 replace_items/remove_items。
+- 用户对上一轮问题的简短回答可标为 contextual。例如上一轮问年龄限制是否硬性，本轮“硬性的”应更新原年龄条目。
+- 格式换算标为 normalized，例如两年=24个月、月薪范围的周期=month。
+- 明确字段和明确列表条目立即放入 patch。即使同轮还有不确定内容，也不能丢弃确定 patch。
 
-输出必须包含 route（category/action/confidence/reason）、intent、task_relation、fields、field_evidence、
-semantic_facts、confidence、requires_clarification、clarification_questions、coverage 和 natural_reply。
-在创建态补充当前草稿用 continue_current；用户明确另起岗位任务用 start_new；其余用 not_applicable。
-每个非列表字段都要有 field_evidence，证据必须逐字来自本轮输入；推断值不能进入 fields。
-低置信度或存在关键歧义时 requires_clarification=true，fields 只保留无歧义内容，并给出自然追问。
+严格遵守来源边界：
+- explicit、contextual、normalized 可写入正式 patch。
+- 不得根据岗位名称生成职责、要求、技能、福利或建议；没有原文证据的内容不得进入 patch。
+- 绝不能根据职业自行补充年龄、性别、学历、经验年限、证书、薪资、班次或硬性技能。
+- 用户明确说出的年龄等限制仍属于 explicit，应正常写入。
 
-JD 处理完全由你完成：识别章节和条目，拆分原子事实，区分 responsibility、requirement、skill、
-benefit、unknown，并在不增强条件的前提下改写成自然、可发布的文本。每条 semantic_fact 必须引用
-本轮原文 evidence_text；保留 source_section 和 source_item_index。explicit 且分类明确的事实才可投影；
-inferred/unknown 必须 needs_confirmation=true 且不得进入 fields。职责是入职后执行的工作；要求是候选人
-入职前应具备的条件；技能字段只放原文明确出现的简短标签；福利是公司提供的待遇。
-不得新增原文没有的学历、年限、证书、技术、薪资、熟练度或“必须/精通/独立负责”等强度。
-coverage 应覆盖识别到的每个 JD 条目，并保留原文、章节、顺序和字符位置；无法可靠判断时标为
-needs_clarification。natural_reply 用于帮助、闲聊、澄清或超范围回复，应自然简短且不声称已写入。
+明确表达不得降级成建议或确认项。例如“在黑钢国际当保镖，月薪6w”必须立即写入 company_name=黑钢国际、title=保镖、salary_min=60000、salary_max=60000、salary_period=month；不得询问这些字段是否确定。“招募实习生”只表示实习招聘/用工类型，不得自动产生“在校学生或应届毕业生”、每周出勤天数或实习期限。
+
+排班、出勤、工作时间、跟随负责人行程等是工作条件，不是岗位职责。现有字段无法单独存储时，应写入 requirements_json；例如“出勤根据boss时间安排”规范为“工作时间根据负责人安排”。
+
+只有真正的 yes/no 歧义才能返回 pending_decision，其中必须携带用户确认后才应用的完整增量 patch。不要只在 clarification_question 文本中提到一个尚未写入的值。开放式补充问题只使用 clarification_question，不创建空的 pending_decision。
+
+不要重复追问公司名称、岗位名称、薪资、经验等已明确字段。requires_clarification 只表示还有一个真正影响写入的歧义；clarification_question 每轮最多一个。用户说“确认、是的、对、可以”时，结合 context.pending_decision 判断是在接受待确认 patch；没有待确认 patch 且 ready_to_save=true 时才表示最终保存。natural_reply 用于查询、帮助、闲聊或超范围回答。
+
+结构化结果还必须满足：
+- mentioned_fields 列出本轮用户明确声明的每个业务字段。
+- evidence_spans 为每个明确字段给出逐字来自本轮输入的证据。
+- ignored_fragments 记录已识别但当前 schema 不保存的片段，例如部门名称。
+- 完整 JD 的编号职责和要求必须逐条原样保留，不得概括、合并或遗漏；清理 Markdown 包装符号即可。
+- 查询只生成 QueryPlan（count/list/detail 及白名单过滤字段），绝不能生成 SQL。
+- 用户未明确要求“详情”时，查询 mode 必须为 list 或 count。
+
+意图：create 新建；update 补充当前草稿或修改已有岗位；delete 删除；search 列表；count 计数；detail 详情；help/conversation/unsupported。创建态内普通补充使用 update + continue_current；明确另起岗位才使用 start_new。
 """
-
-
-def deterministic_command(
-    text: str, phase: str | Phase = Phase.IDLE.value,
-) -> StructuredCommand | None:
-    """Deprecated compatibility hook; business-language rules are disabled."""
-    return None
 
 
 class LLMConfigurationError(RuntimeError):
@@ -71,8 +70,7 @@ class StructuredInterpreter:
     def _client() -> Any:
         if not is_valid_api_key(DEEPSEEK_API_KEY):
             raise LLMConfigurationError(
-                "模型暂时不可用：DEEPSEEK_API_KEY 未配置或仍是示例值。岗位草稿已保留，"
-                "请配置模型后重试。"
+                "模型暂时不可用：DEEPSEEK_API_KEY 未配置或仍是示例值。岗位草稿已保留，请配置后重试。"
             )
         from openai import OpenAI
 
@@ -118,46 +116,7 @@ class StructuredInterpreter:
                     {"role": "assistant", "content": content or "{}"},
                     {"role": "user", "content": f"JSON 不符合类型化协议：{exc}。请修正后完整输出。"},
                 ])
-        raise LLMServiceError(f"模型未返回有效的类型化结果，岗位草稿已保留：{last_error}")
-
-    def rewrite_semantic_facts(
-        self, facts: list[SemanticFact], original_text: str,
-    ) -> ConstrainedRewriteBatch:
-        """Optional LLM copy editor; the agent does not need it for interpretation."""
-        if not facts:
-            return ConstrainedRewriteBatch()
-        schema = json.dumps(ConstrainedRewriteBatch.model_json_schema(), ensure_ascii=False)
-        payload = [
-            {
-                "index": index,
-                "value": fact.value,
-                "category": fact.category,
-                "importance": fact.importance,
-                "evidence": fact.evidence_texts or [fact.evidence_text],
-            }
-            for index, fact in enumerate(facts)
-            if fact.source_type in {"explicit", "user_confirmed"} and fact.category != "unknown"
-        ]
-        response = self._client().chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "你是 JD 受约束改写器。只能基于给定 evidence 改写，不得新增技术、学历、年限、"
-                        "证书、薪资或能力强度；必须用 evidence_indices 逐条引用。只输出 schema JSON：" + schema
-                    ),
-                },
-                {"role": "user", "content": json.dumps({"source": original_text, "facts": payload}, ensure_ascii=False)},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=4_000,
-            stream=False,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
-        return ConstrainedRewriteBatch.model_validate_json(
-            _strip_json_fence(response.choices[0].message.content or "{}")
-        )
+        raise LLMServiceError(f"模型未返回有效类型化结果，岗位草稿已保留：{last_error}")
 
     def respond_to_conversation(self, text: str, context: dict[str, Any]) -> str:
         response = self._client().chat.completions.create(
@@ -165,10 +124,7 @@ class StructuredInterpreter:
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "你是招聘岗位助手。根据任务状态自然简短回复；不得虚构岗位事实，"
-                        "不得声称已读写数据或替用户确认。"
-                    ),
+                    "content": "你是招聘岗位助手。根据当前草稿自然简短回答，不得虚构岗位事实或声称已写入数据。",
                 },
                 {"role": "user", "content": json.dumps({"context": context, "input": text}, ensure_ascii=False)},
             ],

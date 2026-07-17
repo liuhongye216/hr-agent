@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -45,8 +46,23 @@ async def _render(payload: dict[str, Any]) -> None:
 
 
 async def _safe_call(method: str, path: str, **kwargs: Any) -> None:
+    lock = cl.user_session.get("api_request_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        cl.user_session.set("api_request_lock", lock)
     try:
-        await _render(await _request(method, path, **kwargs))
+        async with lock:
+            version = cl.user_session.get("api_state_version", 0)
+            if path.endswith("/messages"):
+                request_json = dict(kwargs.get("json", {}))
+                request_json["expected_version"] = version
+                kwargs["json"] = request_json
+            elif any(token in path for token in ("/confirm", "/cancel", "/select/")):
+                separator = "&" if "?" in path else "?"
+                path = f"{path}{separator}expected_version={version}"
+            payload = await _request(method, path, **kwargs)
+            cl.user_session.set("api_state_version", payload.get("state_version", 0))
+            await _render(payload)
     except RuntimeError as exc:
         await cl.Message(content=str(exc)).send()
 
@@ -63,6 +79,8 @@ async def on_chat_start() -> None:
     try:
         payload = await _request("POST", "/sessions")
         cl.user_session.set("api_session_id", payload["session_id"])
+        cl.user_session.set("api_state_version", payload.get("state_version", 0))
+        cl.user_session.set("api_request_lock", asyncio.Lock())
         await _render(payload)
     except RuntimeError as exc:
         await cl.Message(content=str(exc)).send()
@@ -76,7 +94,8 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(content=str(exc)).send()
         return
     await _safe_call(
-        "POST", f"/sessions/{session_id}/messages", json={"content": message.content},
+        "POST", f"/sessions/{session_id}/messages",
+        json={"content": message.content},
     )
 
 
@@ -88,7 +107,8 @@ async def confirm_write(_: cl.Action) -> None:
 @cl.action_callback("continue_edit")
 async def continue_edit(_: cl.Action) -> None:
     await _safe_call(
-        "POST", f"/sessions/{_session_id()}/messages", json={"content": "继续修改"},
+        "POST", f"/sessions/{_session_id()}/messages",
+        json={"content": "继续修改"},
     )
 
 

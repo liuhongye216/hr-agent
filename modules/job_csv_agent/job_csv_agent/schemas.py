@@ -21,6 +21,7 @@ JSON_FIELDS = frozenset({
 })
 SYSTEM_FIELDS = frozenset({"job_id", "scraped_at", "content_hash", "extraction_mode"})
 EDITABLE_FIELDS = tuple(column for column in BUSINESS_COLUMNS if column not in SYSTEM_FIELDS)
+SCALAR_FIELDS = frozenset(set(EDITABLE_FIELDS) - JSON_FIELDS)
 REQUIRED_CREATE_FIELDS = ("company_name", "title")
 CREATE_CONTENT_FIELDS = ("requirements_json", "responsibilities_json")
 
@@ -34,7 +35,7 @@ FIELD_LABELS = {
     "experience_max_months": "最高经验（月）", "requirements_json": "任职要求",
     "responsibilities_json": "岗位职责", "skills_json": "技能要求",
     "certificates_json": "证书", "benefits_json": "福利", "source_url": "来源链接",
-    "job_content": "任职要求、岗位职责或完整 JD 文本",
+    "job_content": "任职要求或岗位职责",
 }
 
 
@@ -45,86 +46,28 @@ class Phase(StrEnum):
     CONFIRMING = "CONFIRMING"
 
 
-class RouteCategory(StrEnum):
-    JOB_WRITE = "job_write"
-    JOB_READ = "job_read"
-    TASK_CONTROL = "task_control"
-    HELP = "help"
-    CONVERSATION = "conversation"
-    UNSUPPORTED = "unsupported"
-
-
-class QueryResultKind(StrEnum):
-    SCALAR = "scalar"
-    TABLE = "table"
-    DETAIL = "detail"
-    CLARIFICATION = "clarification"
-
-
-class RouteDecision(BaseModel):
-    """Typed top-level capability selection, separate from field extraction."""
+class QueryPlan(BaseModel):
+    """A small read-only query language. It deliberately has no SQL escape hatch."""
 
     model_config = ConfigDict(extra="forbid")
 
-    category: RouteCategory
-    action: Literal[
-        "create", "update", "delete", "publish",
-        "list", "filter", "detail", "count", "aggregate",
-        "confirm", "cancel", "continue_edit", "select",
-        "explain_capabilities", "chat", "unsupported",
-    ]
-    confidence: float = Field(default=1.0, ge=0, le=1)
-    reason: str = ""
+    mode: Literal["count", "list", "detail"]
+    company_name: str | None = None
+    title: str | None = None
+    city: str | None = None
+    recruitment: Literal["internship", "campus", "experienced", "mixed", "unknown"] | None = None
+    limit: int = Field(default=10, ge=1, le=10)
 
-
-class LLMRouteDecision(RouteDecision):
-    """Model route with explicitly supplied confidence and rationale."""
-
-    confidence: float = Field(ge=0, le=1)
-    reason: str
-
-
-class QueryResult(BaseModel):
-    """Result envelope that prevents aggregate rows from being rendered as jobs."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    kind: QueryResultKind
-    rows: list[dict[str, Any]] = Field(default_factory=list)
-    scalar_name: str | None = None
-    scalar_value: int | float | str | None = None
-    message: str | None = None
-    generator: Literal["rules", "llm"] | None = None
-    explanation: str | None = None
-
-
-class JDSourceItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    text: str = Field(min_length=1)
-    section: Literal[
-        "job_description", "responsibilities", "work_content", "requirements",
-        "qualifications", "benefits", "unknown",
-    ] = "unknown"
-    item_index: int = Field(ge=1)
-    source_start: int = Field(ge=0)
-    source_end: int = Field(ge=0)
-
-
-class CoverageItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    source_item: JDSourceItem
-    status: Literal[
-        "projected_responsibility", "projected_requirement", "projected_skill",
-        "projected_benefit", "projected_scalar", "needs_clarification", "ignored",
-    ]
-    targets: list[str] = Field(default_factory=list)
-    reason: str = Field(min_length=1)
+    def filters(self) -> dict[str, str]:
+        return {
+            field: str(value)
+            for field in ("company_name", "title", "city", "recruitment")
+            if (value := getattr(self, field)) is not None
+        }
 
 
 class JobFields(BaseModel):
-    """LLM-editable fields. System fields are deliberately absent."""
+    """All user-editable CSV fields; system-managed columns are deliberately absent."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -161,11 +104,8 @@ class JobFields(BaseModel):
 
     @field_validator("title")
     @classmethod
-    def title_must_be_a_complete_name(cls, value: str | None) -> str | None:
-        # This is a format boundary, not language understanding.  In particular it
-        # prevents a model/tokenisation error from persisting the one-character
-        # suffix "聘" as a position name.
-        if value is not None and len(value.strip()) < 2:
+    def title_must_be_complete(cls, value: str | None) -> str | None:
+        if value is not None and len(value) < 2:
             raise ValueError("title must contain at least two characters")
         return value
 
@@ -176,237 +116,170 @@ class JobFields(BaseModel):
             return None
         result: list[str] = []
         for item in value:
-            cleaned = " ".join(item.split())
+            cleaned = " ".join(str(item).split()).strip()
             if cleaned and cleaned not in result:
                 result.append(cleaned)
         return result
 
-    @field_validator("experience_max_months")
-    @classmethod
-    def validate_experience_range(cls, value: int | None, info: Any) -> int | None:
-        minimum = info.data.get("experience_min_months")
-        if value is not None and minimum is not None and value < minimum:
-            raise ValueError("must be greater than or equal to experience_min_months")
-        return value
-
-    @field_validator("salary_max")
-    @classmethod
-    def validate_salary_range(cls, value: float | None, info: Any) -> float | None:
-        minimum = info.data.get("salary_min")
-        if value is not None and minimum is not None and value < minimum:
-            raise ValueError("must be greater than or equal to salary_min")
-        return value
-
-
-class SemanticFact(BaseModel):
-    """Internal evidence-bearing fact; CSV projection deliberately stores only value strings."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    value: str = Field(min_length=1)
-    category: Literal["responsibility", "requirement", "skill", "benefit", "unknown"]
-    importance: Literal["must", "preferred", "neutral", "unknown"] = "unknown"
-    source_type: Literal["explicit", "inferred", "user_confirmed"]
-    evidence_text: str = Field(min_length=1)
-    evidence_texts: list[str] = Field(default_factory=list)
-    needs_confirmation: bool = False
-    source_section: Literal[
-        "job_description", "responsibilities", "work_content", "requirements",
-        "qualifications", "benefits", "unknown",
-    ] = "unknown"
-    source_item_index: int | None = Field(default=None, ge=1)
-    subject: Literal["employee", "candidate", "company", "unknown"] = "unknown"
-    action: str | None = None
-    action_object: str | None = None
-    certainty: Literal["explicit", "inferred", "user_confirmed"] | None = None
-
-    @field_validator("value", "evidence_text")
-    @classmethod
-    def clean_text(cls, value: str) -> str:
-        return " ".join(value.split())
-
     @model_validator(mode="after")
-    def enforce_confirmation_boundary(self) -> "SemanticFact":
-        if not self.evidence_texts:
-            self.evidence_texts = [self.evidence_text]
-        if self.certainty is None:
-            self.certainty = self.source_type
-        if self.source_type == "inferred" or self.category == "unknown":
-            self.needs_confirmation = True
+    def validate_ranges(self) -> "JobFields":
+        if (
+            self.salary_min is not None and self.salary_max is not None
+            and self.salary_max < self.salary_min
+        ):
+            raise ValueError("salary_max must be greater than or equal to salary_min")
+        if (
+            self.experience_min_months is not None and self.experience_max_months is not None
+            and self.experience_max_months < self.experience_min_months
+        ):
+            raise ValueError("experience_max_months must be greater than or equal to experience_min_months")
         return self
 
 
-class JDAnalysis(BaseModel):
-    """Typed output of section parsing, fact extraction, projection hints and coverage."""
+ProvenanceSource = Literal["explicit", "contextual", "normalized"]
+ModelPatchSource = Literal["explicit", "contextual", "normalized"]
 
+
+class PatchItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    facts: list[SemanticFact] = Field(default_factory=list)
-    coverage: list[CoverageItem] = Field(default_factory=list)
-    scalar_fields: JobFields = Field(default_factory=JobFields)
-    clarification_questions: list[str] = Field(default_factory=list)
+    value: str = Field(min_length=1)
+    source: ModelPatchSource = "explicit"
 
-
-class RewriteResult(BaseModel):
-    """Internal safety decision for one piece of JD copy."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    original_text: str = Field(min_length=1)
-    rewritten_text: str = Field(min_length=1)
-    category: Literal["responsibility", "requirement", "skill", "benefit", "unknown"]
-    source_type: Literal["explicit", "inferred", "user_confirmed"]
-    evidence_level: Literal["direct", "contextual", "none"]
-    confidence: float = Field(ge=0, le=1)
-    decision: Literal["safe_rewrite", "needs_confirmation", "reject_or_clarify"]
-    reason: str = Field(min_length=1)
-
-    @field_validator("original_text", "rewritten_text", "reason")
+    @field_validator("value")
     @classmethod
-    def clean_rewrite_text(cls, value: str) -> str:
-        return " ".join(value.split())
+    def clean_value(cls, value: str) -> str:
+        return " ".join(value.split()).strip(" ，,；;。.!！")
 
 
-class ConstrainedRewrite(BaseModel):
-    """LLM proposal; deterministic code still decides whether it may be projected."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    rewritten_text: str = Field(min_length=1)
-    category: Literal["responsibility", "requirement", "skill", "benefit", "unknown"]
-    evidence_indices: list[int] = Field(min_length=1)
-    preserves_strength: bool
-    notes: str = ""
-
-
-class ConstrainedRewriteBatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    rewrites: list[ConstrainedRewrite] = Field(default_factory=list)
-
-
-class SemanticIssue(BaseModel):
-    """User-facing semantic review result produced before persistence."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    level: Literal["pass", "warning", "blocking"]
-    field: str | None = None
-    value: str | None = None
-    message: str
-
-
-class FieldEvidence(BaseModel):
-    """Evidence for one scalar field extracted by the language model."""
-
+class ListReplacement(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     field: Literal[
-        "title", "company_name", "city", "work_address", "salary_min", "salary_max",
-        "salary_currency", "salary_period", "recruitment", "employment", "work_mode",
-        "education_min_level", "experience_min_months", "experience_max_months", "source_url",
+        "requirements_json", "responsibilities_json", "skills_json",
+        "certificates_json", "benefits_json",
     ]
-    value: str | int | float
-    evidence_text: str = Field(min_length=1)
-    confidence: float = Field(ge=0, le=1)
-    source_type: Literal["explicit", "user_confirmed", "inferred"] = "explicit"
+    match: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+    source: ModelPatchSource = "explicit"
 
-    @field_validator("evidence_text")
-    @classmethod
-    def clean_evidence(cls, value: str) -> str:
-        return " ".join(value.split())
+
+class EvidenceSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+
+class IgnoredFragment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class DraftPatch(BaseModel):
+    """Incremental edit protocol. List fields are never replaced wholesale."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    set_fields: dict[str, Any] = Field(default_factory=dict)
+    set_sources: dict[str, ModelPatchSource] = Field(default_factory=dict)
+    append_items: dict[str, list[PatchItem]] = Field(default_factory=dict)
+    replace_items: list[ListReplacement] = Field(default_factory=list)
+    remove_items: dict[str, list[str]] = Field(default_factory=dict)
+    clear_fields: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_patch_fields(self) -> "DraftPatch":
+        invalid_set = sorted(set(self.set_fields) - SCALAR_FIELDS)
+        invalid_sources = sorted(set(self.set_sources) - set(self.set_fields))
+        invalid_lists = sorted((set(self.append_items) | set(self.remove_items)) - JSON_FIELDS)
+        invalid_clear = sorted(set(self.clear_fields) - set(EDITABLE_FIELDS))
+        if invalid_set:
+            raise ValueError(f"set_fields contains non-scalar or unknown fields: {', '.join(invalid_set)}")
+        if invalid_sources:
+            raise ValueError(f"set_sources has no matching value: {', '.join(invalid_sources)}")
+        if invalid_lists:
+            raise ValueError(f"invalid list fields: {', '.join(invalid_lists)}")
+        if invalid_clear:
+            raise ValueError(f"non-editable fields: {', '.join(invalid_clear)}")
+        self.clear_fields = list(dict.fromkeys(self.clear_fields))
+        return self
+
+
+class PendingDecision(BaseModel):
+    """One machine-actionable yes/no decision; never a second full draft."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["accept_patch"] = "accept_patch"
+    prompt: str = Field(min_length=1)
+    patch: DraftPatch
+    reason: str = "该信息存在真实歧义，需要用户确认"
 
 
 class StructuredCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     intent: Literal[
-        "create", "update", "delete", "search", "confirm", "cancel", "unknown",
+        "create", "update", "delete", "search", "count", "detail", "confirm", "cancel", "unknown",
         "help", "conversation", "unsupported",
     ]
-    route: RouteDecision | None = None
     search_query: str | None = None
+    query_plan: QueryPlan | None = None
     selection_index: int | None = Field(default=None, ge=1)
-    fields: JobFields = Field(default_factory=JobFields)
-    clear_fields: list[str] = Field(default_factory=list)
-    semantic_facts: list[SemanticFact] = Field(default_factory=list)
-    clarification_questions: list[str] = Field(default_factory=list)
-    coverage: list[CoverageItem] = Field(default_factory=list)
-    confidence: float = Field(default=1.0, ge=0, le=1)
+    patch: DraftPatch = Field(default_factory=DraftPatch)
+    mentioned_fields: list[str] = Field(default_factory=list)
+    evidence_spans: list[EvidenceSpan] = Field(default_factory=list)
+    ignored_fragments: list[IgnoredFragment] = Field(default_factory=list)
+    pending_decision: PendingDecision | None = None
+    clarification_question: str | None = None
     requires_clarification: bool = False
-    field_evidence: list[FieldEvidence] = Field(default_factory=list)
     natural_reply: str | None = None
     task_relation: Literal["continue_current", "start_new", "not_applicable"] = "not_applicable"
 
-    @field_validator("clear_fields")
+    @field_validator("mentioned_fields")
     @classmethod
-    def only_editable_clear_fields(cls, value: list[str]) -> list[str]:
+    def validate_mentioned_fields(cls, value: list[str]) -> list[str]:
         invalid = sorted(set(value) - set(EDITABLE_FIELDS))
         if invalid:
-            raise ValueError(f"non-editable fields: {', '.join(invalid)}")
+            raise ValueError(f"mentioned_fields contains unknown fields: {', '.join(invalid)}")
         return list(dict.fromkeys(value))
-
-    @field_validator("clarification_questions")
-    @classmethod
-    def clean_questions(cls, value: list[str]) -> list[str]:
-        return list(dict.fromkeys(" ".join(item.split()) for item in value if item.strip()))
-
-    @model_validator(mode="after")
-    def route_must_match_command(self) -> "StructuredCommand":
-        if self.route is None:
-            return self
-        expected = {
-            "create": RouteCategory.JOB_WRITE,
-            "update": RouteCategory.JOB_WRITE,
-            "delete": RouteCategory.JOB_WRITE,
-            "search": RouteCategory.JOB_READ,
-            "confirm": RouteCategory.TASK_CONTROL,
-            "cancel": RouteCategory.TASK_CONTROL,
-            "help": RouteCategory.HELP,
-            "conversation": RouteCategory.CONVERSATION,
-            "unsupported": RouteCategory.UNSUPPORTED,
-        }.get(self.intent)
-        if expected is not None and self.route.category != expected:
-            raise ValueError(f"route category {self.route.category} conflicts with intent {self.intent}")
-        return self
 
 
 class LLMInterpretation(StructuredCommand):
-    """Strict protocol accepted from an LLM for every open-ended user turn.
-
-    Deterministic task-control commands intentionally use ``StructuredCommand``;
-    only model output must carry the complete routing/evidence envelope.
-    """
-
-    route: LLMRouteDecision
-    fields: JobFields
-    field_evidence: list[FieldEvidence]
-    semantic_facts: list[SemanticFact]
-    confidence: float = Field(ge=0, le=1)
-    requires_clarification: bool
-    clarification_questions: list[str]
-    coverage: list[CoverageItem]
-    natural_reply: str | None
-    task_relation: Literal["continue_current", "start_new", "not_applicable"]
+    """Strict typed result accepted from the language model."""
 
     @model_validator(mode="after")
-    def require_complete_model_envelope(self) -> "LLMInterpretation":
-        scalar_fields = set(self.fields.model_dump(exclude_none=True)) - JSON_FIELDS
-        evidenced = {item.field for item in self.field_evidence}
-        missing = sorted(scalar_fields - evidenced)
-        if missing:
-            raise ValueError(f"scalar fields missing evidence: {', '.join(missing)}")
-        if self.requires_clarification and not self.clarification_questions:
-            raise ValueError("requires_clarification needs at least one clarification question")
-        if self.route.category != RouteCategory.JOB_WRITE and self.task_relation != "not_applicable":
-            raise ValueError("non-write routes must use task_relation=not_applicable")
-        if self.intent in {"delete", "search", "help", "conversation", "unsupported"} and self.task_relation != "not_applicable":
-            raise ValueError(f"intent {self.intent} must use task_relation=not_applicable")
+    def validate_model_protocol(self) -> "LLMInterpretation":
+        if self.intent in {"search", "count", "detail"} and self.query_plan is None:
+            raise ValueError("query intents require a QueryPlan")
+        touched = (
+            set(self.patch.set_fields) | set(self.patch.append_items)
+            | set(self.patch.remove_items) | set(self.patch.clear_fields)
+            | {item.field for item in self.patch.replace_items}
+        )
+        if self.pending_decision is not None:
+            pending = self.pending_decision.patch
+            touched |= (
+                set(pending.set_fields) | set(pending.append_items)
+                | set(pending.remove_items) | set(pending.clear_fields)
+                | {item.field for item in pending.replace_items}
+            )
+        undeclared = sorted(touched - set(self.mentioned_fields))
+        if undeclared:
+            raise ValueError(f"patch fields missing from mentioned_fields: {', '.join(undeclared)}")
+        evidenced = {span.field for span in self.evidence_spans}
+        missing_evidence = sorted(set(self.mentioned_fields) - evidenced)
+        if missing_evidence:
+            raise ValueError(f"mentioned_fields missing evidence: {', '.join(missing_evidence)}")
         return self
 
 
 class ChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=10_000)
+    expected_version: int | None = Field(default=None, ge=0)
 
 
 class ChatResponse(BaseModel):
@@ -417,3 +290,4 @@ class ChatResponse(BaseModel):
     candidates: list[dict[str, str]] = Field(default_factory=list)
     can_confirm: bool = False
     can_cancel: bool = False
+    state_version: int = Field(default=0, ge=0)

@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from typing import Any, Protocol, TypedDict
 
-from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
-from .guards import guard_model_command, normalize_job_fields, semantic_review, text_key
-from .jd_text2sql_adapter import JDText2SQLAdapter
 from .llm import LLMConfigurationError, LLMServiceError
-from .routing import resolve_route
-from .schemas import (
-    CREATE_CONTENT_FIELDS, FIELD_LABELS, JSON_FIELDS, REQUIRED_CREATE_FIELDS, JobFields, Phase,
-    QueryResultKind, RouteCategory, SemanticFact, StructuredCommand,
+from .normalization import normalize_patch
+from .patching import (
+    apply_draft_patch, changed_fields, sanitize_model_patch, unapplied_fields,
 )
 from .repository import CsvJobRepository
+from .schemas import (
+    CREATE_CONTENT_FIELDS, FIELD_LABELS, JSON_FIELDS, REQUIRED_CREATE_FIELDS,
+    DraftPatch, JobFields, Phase, QueryPlan, StructuredCommand,
+)
 
 
 class Interpreter(Protocol):
@@ -24,58 +25,42 @@ class Interpreter(Protocol):
 
 class AgentState(TypedDict, total=False):
     phase: str
-    user_input: str
-    forced_command: dict[str, Any] | None
     draft: dict[str, Any]
-    semantic_facts: list[dict[str, Any]]
-    coverage: list[dict[str, Any]]
-    clarification_questions: list[str]
-    unanswered_questions: list[str]
-    asked_questions: list[str]
-    pending_suggestions: dict[str, list[str]]
-    dismissed_suggestions: list[str]
-    missing_important_fields: list[str]
-    incomplete_warning_acknowledged: bool
+    provenance: dict[str, Any]
+    recent_messages: list[dict[str, str]]
+    last_assistant_question: str | None
+    pending_decision: dict[str, Any] | None
+    pending_action: str | None
     target_id: str | None
     candidates: list[dict[str, str]]
-    pending_action: str | None
-    pending_fields: dict[str, Any]
-    pending_clear_fields: list[str]
-    pending_semantic_facts: list[dict[str, Any]]
-    message: str
-    missing_fields: list[str]
     can_confirm: bool
     can_cancel: bool
+    message: str
+    missing_fields: list[str]
+    state_version: int
+    draft_revision: int
+    preview_revision: int | None
 
 
 def initial_state() -> AgentState:
     return {
         "phase": Phase.IDLE.value,
         "draft": {},
-        "semantic_facts": [],
-        "coverage": [],
-        "clarification_questions": [],
-        "unanswered_questions": [],
-        "asked_questions": [],
-        "pending_suggestions": {},
-        "dismissed_suggestions": [],
-        "missing_important_fields": [],
-        "incomplete_warning_acknowledged": False,
+        "provenance": {},
+        "recent_messages": [],
+        "last_assistant_question": None,
+        "pending_decision": None,
+        "pending_action": None,
         "target_id": None,
         "candidates": [],
-        "pending_action": None,
-        "pending_fields": {},
-        "pending_clear_fields": [],
-        "pending_semantic_facts": [],
-        "message": "你好，我可以帮你查询统计岗位、整理 JD，或安全地新增、修改和删除岗位。",
-        "missing_fields": [],
         "can_confirm": False,
         "can_cancel": False,
+        "message": "你好，我可以帮你查询、统计、新增、修改或删除招聘岗位。",
+        "missing_fields": [],
+        "state_version": 0,
+        "draft_revision": 0,
+        "preview_revision": None,
     }
-
-
-def _clean_turn() -> dict[str, Any]:
-    return {"user_input": "", "forced_command": None}
 
 
 def _reset(message: str) -> AgentState:
@@ -84,93 +69,13 @@ def _reset(message: str) -> AgentState:
     return state
 
 
-def _display_value(field: str, value: Any) -> str:
-    if value in (None, ""):
-        return "（空）"
-    if field in JSON_FIELDS and isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            pass
-    if isinstance(value, list):
-        return "、".join(str(item) for item in value) or "（空列表）"
-    friendly_values = {
-        "full_time": "全职", "part_time": "兼职", "full_or_part_time": "全职或兼职",
-        "internship": "实习", "contract": "合同制", "temporary": "临时用工",
-        "onsite": "现场办公", "remote": "远程办公", "hybrid": "混合办公",
-        "campus": "校园招聘", "experienced": "社会招聘", "mixed": "不限",
-        "month": "月", "year": "年", "day": "日", "hour": "小时", "per_order": "单",
-    }
-    if isinstance(value, str) and value in friendly_values:
-        return friendly_values[value]
-    return str(value)
-
-
-def _field_lines(fields: dict[str, Any]) -> str:
-    if not fields:
-        return "（本轮没有新增信息）"
-    return "\n".join(
-        f"- {FIELD_LABELS.get(key, key)}：{_display_value(key, value)}" for key, value in fields.items()
-    )
-
-
-_ENUM_TO_CN = {
-    "internship": "实习", "campus": "校园招聘", "experienced": "社会招聘",
-    "mixed": "不限", "unknown": "未知", "full_time": "全职", "part_time": "兼职",
-    "full_or_part_time": "全职或兼职", "contract": "合同制", "temporary": "临时用工",
-    "onsite": "现场办公", "remote": "远程办公", "hybrid": "混合办公",
-}
-_CN_TO_ENUM = {
-    "recruitment": {"实习": "internship", "校园招聘": "campus", "社会招聘": "experienced", "不限": "mixed", "未知": "unknown"},
-    "employment": {"实习": "internship", "全职": "full_time", "兼职": "part_time", "全职或兼职": "full_or_part_time", "合同制": "contract", "临时用工": "temporary", "未知": "unknown"},
-    "work_mode": {"现场办公": "onsite", "远程办公": "remote", "混合办公": "hybrid", "未知": "unknown"},
-}
-_EDUCATION_TO_CN = {0: "不限", 1: "初中", 2: "高中/中专", 3: "大专", 4: "本科", 5: "硕士", 6: "博士"}
-_CN_TO_EDUCATION = {value: key for key, value in _EDUCATION_TO_CN.items()}
-_BUSINESS_JSON_KEYS = {
-    "公司名称", "岗位名称", "招聘类型", "用工类型", "最低经验月数", "任职要求", "岗位职责",
-    "技能要求", "工作城市", "办公模式", "学历要求", "薪资范围", "实习要求",
-}
-
-
 def _as_list(value: Any) -> list[str]:
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except json.JSONDecodeError:
-            return []
+            value = []
     return [str(item) for item in value or []]
-
-
-def _business_preview(draft: dict[str, Any]) -> dict[str, Any]:
-    salary = None
-    if draft.get("salary_min") is not None or draft.get("salary_max") is not None:
-        salary = {
-            "最低": draft.get("salary_min"),
-            "最高": draft.get("salary_max"),
-            "币种": draft.get("salary_currency") or "CNY",
-            "周期": draft.get("salary_period") or "month",
-        }
-    education = draft.get("education_min_level")
-    return {
-        "公司名称": draft.get("company_name"),
-        "岗位名称": draft.get("title"),
-        "招聘类型": _ENUM_TO_CN.get(draft.get("recruitment"), draft.get("recruitment")),
-        "用工类型": _ENUM_TO_CN.get(draft.get("employment"), draft.get("employment")),
-        "最低经验月数": draft.get("experience_min_months"),
-        "任职要求": _as_list(draft.get("requirements_json")),
-        "岗位职责": _as_list(draft.get("responsibilities_json")),
-        "技能要求": _as_list(draft.get("skills_json")),
-        "工作城市": draft.get("city"),
-        "办公模式": _ENUM_TO_CN.get(draft.get("work_mode"), draft.get("work_mode")),
-        "学历要求": _EDUCATION_TO_CN.get(int(education), education) if education is not None else None,
-        "薪资范围": salary,
-        "实习要求": None,
-    }
-
-
-def _preview_json(draft: dict[str, Any]) -> str:
-    return json.dumps(_business_preview(draft), ensure_ascii=False, indent=2)
 
 
 def _row_draft(row: dict[str, Any]) -> dict[str, Any]:
@@ -178,799 +83,423 @@ def _row_draft(row: dict[str, Any]) -> dict[str, Any]:
     for key, value in row.items():
         if key not in JobFields.model_fields or value in (None, ""):
             continue
-        if key in JSON_FIELDS:
-            try:
-                value = json.loads(value) if isinstance(value, str) else value
-            except json.JSONDecodeError:
-                value = []
-        result[key] = value
+        result[key] = _as_list(value) if key in JSON_FIELDS else value
     return JobFields.model_validate(result).model_dump(exclude_none=True)
 
 
-def _draft_json_command(text: str, phase: str) -> StructuredCommand:
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("顶层必须是 JSON 对象")
-    unknown = sorted(set(payload) - _BUSINESS_JSON_KEYS)
-    if unknown:
-        raise ValueError(f"不支持的中文字段：{'、'.join(unknown)}")
-
-    fields: dict[str, Any] = {}
-    clears: list[str] = []
-    simple = {
-        "公司名称": "company_name", "岗位名称": "title", "最低经验月数": "experience_min_months",
-        "任职要求": "requirements_json", "岗位职责": "responsibilities_json", "技能要求": "skills_json",
-        "工作城市": "city",
-    }
-    for label, field in simple.items():
-        if label not in payload:
-            continue
-        value = payload[label]
-        if value is None:
-            clears.append(field)
-        else:
-            if field in JSON_FIELDS and not isinstance(value, list):
-                raise ValueError(f"{label}必须是 JSON 数组，清空请使用 []")
-            fields[field] = value
-    for label, field in (("招聘类型", "recruitment"), ("用工类型", "employment"), ("办公模式", "work_mode")):
-        if label not in payload:
-            continue
-        value = payload[label]
-        if value is None:
-            clears.append(field)
-        elif value in _CN_TO_ENUM[field]:
-            fields[field] = _CN_TO_ENUM[field][value]
-        elif value in _CN_TO_ENUM[field].values():
-            fields[field] = value
-        else:
-            raise ValueError(f"{label}的值不受支持：{value}")
-    if "学历要求" in payload:
-        value = payload["学历要求"]
-        if value is None:
-            clears.append("education_min_level")
-        elif isinstance(value, int) and 0 <= value <= 6:
-            fields["education_min_level"] = value
-        elif value in _CN_TO_EDUCATION:
-            fields["education_min_level"] = _CN_TO_EDUCATION[value]
-        else:
-            raise ValueError("学历要求应为不限、初中、高中/中专、大专、本科、硕士或博士")
-    if "薪资范围" in payload:
-        value = payload["薪资范围"]
-        salary_fields = ("salary_min", "salary_max", "salary_currency", "salary_period")
-        if value is None:
-            clears.extend(salary_fields)
-        elif isinstance(value, dict):
-            salary_map = {"最低": "salary_min", "最高": "salary_max", "币种": "salary_currency", "周期": "salary_period"}
-            if set(value) - set(salary_map):
-                raise ValueError("薪资范围只支持最低、最高、币种、周期")
-            for key, field in salary_map.items():
-                if key in value and value[key] is not None:
-                    fields[field] = value[key]
-        else:
-            raise ValueError("薪资范围应为 null 或包含最低、最高、币种、周期的 JSON 对象")
-    if payload.get("实习要求") not in (None, ""):
-        raise ValueError("当前 jobs.csv 没有独立实习要求字段，请将其作为任职要求中的原子条件填写")
-    intent = "create" if phase == Phase.IDLE.value else "update"
-    return StructuredCommand(
-        intent=intent, fields=JobFields.model_validate(fields), clear_fields=list(dict.fromkeys(clears)),
-    )
-
-
-def _merge_facts(
-    existing: list[dict[str, Any]], incoming: list[SemanticFact],
-) -> list[dict[str, Any]]:
-    result = list(existing)
-    seen = {
-        (item.get("value", "").casefold(), item.get("category"), item.get("source_type"))
-        for item in result
-    }
-    for fact in incoming:
-        item = fact.model_dump(mode="json")
-        key = (fact.value.casefold(), fact.category, fact.source_type)
-        if key not in seen:
-            seen.add(key)
-            result.append(item)
-    return result
-
-
-def _grouped_suggestions(
-    draft: dict[str, Any], facts: list[dict[str, Any]], questions: list[str],
-    dismissed: list[str] | None = None,
-) -> dict[str, list[str]]:
-    dismissed_keys = {text_key(item) for item in dismissed or []}
-    existing_values = [
-        str(value)
-        for field in ("requirements_json", "responsibilities_json", "skills_json", "benefits_json")
-        for value in _as_list(draft.get(field))
-    ]
-    existing_keys = {text_key(item) for item in existing_values}
-    existing_skills = {text_key(item) for item in _as_list(draft.get("skills_json"))}
-    groups = {"岗位职责": [], "任职要求": [], "技能要求": [], "工作信息": []}
-
-    def add(group: str, question: str) -> None:
-        question = re.sub(r"^(?:岗位职责|任职要求|技能要求|工作信息)建议确认：", "", question).strip()
-        key = text_key(question)
-        if not question or key in dismissed_keys:
-            return
-        if question not in groups[group] and sum(len(items) for items in groups.values()) < 3:
-            groups[group].append(question)
-
-    for question in questions:
-        if question.startswith("岗位职责"):
-            group = "岗位职责"
-        elif question.startswith("任职要求"):
-            group = "任职要求"
-        elif question.startswith("技能要求") or re.search(r"Python|PyTorch|技能", question, re.IGNORECASE):
-            group = "技能要求"
-        elif re.search(r"城市|办公|薪资|工作地点", question):
-            group = "工作信息"
-        else:
-            group = "任职要求"
-        add(group, question)
-
-    for fact in facts:
-        if fact.get("source_type") != "inferred":
-            continue
-        value = str(fact.get("value", ""))
-        key = text_key(value)
-        if key in existing_keys or key in dismissed_keys:
-            continue
-        if fact.get("category") == "skill" and key in existing_skills:
-            continue
-        group = {
-            "responsibility": "岗位职责", "requirement": "任职要求",
-            "skill": "技能要求", "unknown": "任职要求",
-        }.get(str(fact.get("category")), "任职要求")
-        add(group, f"是否补充“{value}”？")
-    return {group: items for group, items in groups.items() if items}
-
-
-def _semantic_notes(
-    draft: dict[str, Any], facts: list[dict[str, Any]], questions: list[str],
-    dismissed: list[str] | None = None,
-) -> tuple[str, dict[str, list[str]]]:
-    unknown = [item["value"] for item in facts if item.get("category") == "unknown"]
-    grouped = _grouped_suggestions(draft, facts, questions, dismissed)
-    sections: list[str] = []
-    if unknown:
-        sections.append("仍需您确认：" + "、".join(unknown))
-    if grouped:
-        lines = ["建议补充（确认前不会写入岗位草稿）："]
-        for group, items in grouped.items():
-            lines.extend(["", f"{group}：", *(f"- {item}" for item in items)])
-        sections.append("\n".join(lines))
-    return ("\n\n" + "\n\n".join(sections) if sections else "", grouped)
-
-
-def _important_missing(draft: dict[str, Any]) -> list[str]:
-    missing: list[str] = []
-    checks = (
-        ("responsibilities_json", "岗位职责"),
-        ("requirements_json", "任职要求"),
-        ("skills_json", "技能要求"),
-        ("city", "工作城市"),
-        ("work_mode", "办公模式"),
-        ("employment", "用工类型"),
-        ("education_min_level", "学历要求"),
-    )
-    for field, label in checks:
-        if not draft.get(field):
-            missing.append(label)
-    if not draft.get("salary_min") and not draft.get("salary_max"):
-        missing.append("薪资范围")
-    if not draft.get("experience_min_months") and not draft.get("experience_max_months"):
-        missing.append("经验要求")
-    if draft.get("employment") == "internship" or draft.get("recruitment") == "internship":
-        missing.append("实习时长与每周出勤要求")
+def missing_create_fields(draft: dict[str, Any]) -> list[str]:
+    missing = [field for field in REQUIRED_CREATE_FIELDS if not draft.get(field)]
+    if not any(draft.get(field) for field in CREATE_CONTENT_FIELDS):
+        missing.append("job_content")
     return missing
 
 
-def _priority_questions(draft: dict[str, Any], suggestions: list[str]) -> list[str]:
-    questions: list[str] = []
-    if not draft.get("company_name") and not draft.get("title"):
-        questions.append("请补充公司名称和岗位名称。")
-    elif not draft.get("company_name"):
-        questions.append("请补充公司名称。")
-    elif not draft.get("title"):
-        questions.append("请补充岗位名称。")
-    if not any(draft.get(field) for field in CREATE_CONTENT_FIELDS):
-        questions.append("请补充主要工作内容或任职要求。")
-    questions.extend(suggestions)
-    return list(dict.fromkeys(questions))
+_ENUM_LABELS = {
+    "internship": "实习招聘", "campus": "校园招聘", "experienced": "社会招聘",
+    "mixed": "不限", "unknown": "未明确", "full_time": "全职",
+    "part_time": "兼职", "full_or_part_time": "全职或兼职", "contract": "合同制",
+    "temporary": "临时用工", "onsite": "现场办公", "remote": "远程办公",
+    "hybrid": "混合办公", "month": "月", "year": "年", "day": "日", "hour": "小时",
+}
+
+
+def _display_value(field: str, value: Any) -> str:
+    if value is None or value == "":
+        return "未填写"
+    if field in {"experience_min_months", "experience_max_months"}:
+        return f"{value}个月"
+    if field == "education_min_level":
+        return {4: "本科及以上", 5: "硕士及以上", 6: "博士及以上"}.get(int(value), str(value))
+    return _ENUM_LABELS.get(str(value), str(value))
+
+
+def render_preview(draft: dict[str, Any], provenance: dict[str, Any] | None = None) -> str:
+    del provenance  # provenance is retained for audit, never exposed as internal JSON.
+    scalar_order = (
+        "company_name", "title", "recruitment", "employment", "city", "work_address",
+        "work_mode", "education_min_level", "experience_min_months", "experience_max_months",
+        "salary_min", "salary_max", "salary_currency", "salary_period", "source_url",
+    )
+    lines = ["### 岗位草稿"]
+    for field in scalar_order:
+        if field in draft:
+            lines.append(f"- {FIELD_LABELS[field]}：{_display_value(field, draft[field])}")
+    for field in ("responsibilities_json", "requirements_json", "skills_json", "certificates_json", "benefits_json"):
+        values = _as_list(draft.get(field))
+        if not values:
+            continue
+        lines.append(f"\n**{FIELD_LABELS[field]}**")
+        lines.extend(f"- {value}" for value in values)
+    return "\n".join(lines)
+
+
+def build_context(state: AgentState) -> dict[str, Any]:
+    draft = deepcopy(state.get("draft", {}))
+    return {
+        "phase": state.get("phase", Phase.IDLE.value),
+        "draft": draft,
+        "provenance": deepcopy(state.get("provenance", {})),
+        "last_assistant_question": state.get("last_assistant_question"),
+        "pending_decision": deepcopy(state.get("pending_decision")),
+        "recent_messages": deepcopy(state.get("recent_messages", [])),
+        "ready_to_save": not missing_create_fields(draft),
+        "pending_action": state.get("pending_action"),
+        "candidate_count": len(state.get("candidates", [])),
+        "state_version": state.get("state_version", 0),
+        "draft_revision": state.get("draft_revision", 0),
+    }
+
+
+def _append_recent(state: AgentState, user_text: str, assistant_text: str) -> None:
+    messages = [
+        *state.get("recent_messages", []),
+        {"role": "user", "content": user_text[:2_000]},
+        {"role": "assistant", "content": assistant_text[:2_000]},
+    ][-10:]
+    while sum(len(item["content"]) for item in messages) > 8_000 and len(messages) > 2:
+        messages.pop(0)
+    state["recent_messages"] = messages
+
+
+_AFFIRMATIVE_RE = re.compile(
+    r"^(?:确认|确认了|我确认|确认写入|确定|是|是的|对|对的|可以|没错|好|好的|同意|保存吧)$"
+)
+_NEGATIVE_RE = re.compile(r"^(?:不是|不对|否|不要|不同意|拒绝)$")
+
+
+def _update_summary(patch: DraftPatch, mentioned_fields: list[str]) -> str:
+    parts: list[str] = []
+    for field in dict.fromkeys(mentioned_fields):
+        if field in patch.set_fields:
+            parts.append(f"{FIELD_LABELS.get(field, field)}＝{_display_value(field, patch.set_fields[field])}")
+        elif field in JSON_FIELDS:
+            count = len(patch.append_items.get(field, []))
+            if count:
+                parts.append(f"{FIELD_LABELS.get(field, field)}新增{count}条")
+    return "；".join(parts)
+
+
+def _render_query_detail(detail: dict[str, Any]) -> str:
+    lines = ["### 岗位详情"]
+    order = (
+        "job_id", "company_name", "title", "city", "work_address", "recruitment",
+        "employment", "work_mode", "education_min_level", "experience_min_months",
+        "experience_max_months", "salary_min", "salary_max", "salary_currency",
+        "salary_period", "responsibilities_json", "requirements_json", "skills_json",
+        "certificates_json", "benefits_json", "source_url",
+    )
+    for field in order:
+        if field not in detail:
+            continue
+        value = detail[field]
+        if field in JSON_FIELDS:
+            lines.append(f"\n**{FIELD_LABELS[field]}**")
+            lines.extend(f"- {item}" for item in _as_list(value))
+        else:
+            lines.append(f"- {FIELD_LABELS[field]}：{_display_value(field, value)}")
+    return "\n".join(lines)
 
 
 class JobCsvAgent:
-    def __init__(
-        self,
-        repository: CsvJobRepository,
-        interpreter: Interpreter,
-        query_adapter: JDText2SQLAdapter | None = None,
-    ) -> None:
+    def __init__(self, repository: CsvJobRepository, interpreter: Interpreter) -> None:
         self.repository = repository
         self.interpreter = interpreter
-        self.query_adapter = query_adapter
-        builder = StateGraph(AgentState)
-        builder.add_node("idle", self._idle)
-        builder.add_node("creating", self._creating)
-        builder.add_node("editing", self._editing)
-        builder.add_node("confirming", self._confirming)
-        builder.add_conditional_edges(START, self._route, {
-            "idle": "idle", "creating": "creating", "editing": "editing", "confirming": "confirming",
-        })
-        for node in ("idle", "creating", "editing", "confirming"):
-            builder.add_edge(node, END)
-        self.graph = builder.compile()
 
-    @staticmethod
-    def _route(state: AgentState) -> str:
-        return {
-            Phase.CREATING.value: "creating",
-            Phase.EDITING.value: "editing",
-            Phase.CONFIRMING.value: "confirming",
-        }.get(state.get("phase", Phase.IDLE.value), "idle")
+    def _finish(
+        self, state: AgentState, user_text: str, message: str, *, question: str | None = None,
+    ) -> AgentState:
+        state["message"] = message
+        state["last_assistant_question"] = question
+        _append_recent(state, user_text, message)
+        return state
+
+    def _draft_response(
+        self, state: AgentState, text: str, clarification: str | None = None,
+        update_summary: str = "",
+    ) -> AgentState:
+        draft = state.get("draft", {})
+        missing = missing_create_fields(draft)
+        state["missing_fields"] = missing
+        state["can_cancel"] = True
+        pending = state.get("pending_decision")
+        if pending:
+            clarification = str(pending.get("prompt") or clarification or "请确认这项内容。")
+        prefix = f"本轮已更新：{update_summary}。\n" if update_summary else ""
+        preview = render_preview(draft, state.get("provenance", {}))
+        state["preview_revision"] = state.get("draft_revision", 0)
+        if missing or pending:
+            state["phase"] = Phase.EDITING.value if state.get("pending_action") == "update" else Phase.CREATING.value
+            state["can_confirm"] = False
+            if clarification:
+                question = clarification
+            else:
+                labels = "、".join(FIELD_LABELS.get(field, field) for field in missing)
+                question = f"还缺少：{labels}。请直接补充原文信息。"
+            return self._finish(state, text, f"{prefix}{preview}\n{question}", question=question)
+        state["phase"] = Phase.CONFIRMING.value
+        state["can_confirm"] = True
+        return self._finish(
+            state, text,
+            f"{prefix}{preview}\n当前草稿已达到保存条件，请核对后使用当前版本确认一次。",
+        )
+
+    def _show_current(self, state: AgentState, text: str) -> AgentState:
+        missing = missing_create_fields(state.get("draft", {}))
+        state["missing_fields"] = missing
+        state["can_confirm"] = (
+            not missing and not state.get("pending_decision")
+            and state.get("pending_action") in {"create", "update"}
+            and state.get("preview_revision") == state.get("draft_revision")
+        )
+        return self._finish(state, text, "当前完整草稿：\n" + render_preview(state.get("draft", {})))
+
+    def _select(self, state: AgentState, index: int, text: str) -> AgentState:
+        candidates = state.get("candidates", [])
+        if index < 1 or index > len(candidates):
+            return self._finish(state, text, "选择序号超出范围，请重新选择。")
+        row = candidates[index - 1]
+        state["target_id"] = row["job_id"]
+        state["candidates"] = []
+        if state.get("pending_action") == "delete":
+            state["phase"] = Phase.CONFIRMING.value
+            state["can_confirm"] = True
+            state["can_cancel"] = True
+            state["preview_revision"] = state.get("draft_revision", 0)
+            return self._finish(state, text, f"将删除 {row.get('company_name')} 的 {row.get('title')} 岗位。")
+        state["draft"] = _row_draft(row)
+        state["provenance"] = {}
+        state["draft_revision"] = state.get("draft_revision", 0) + 1
+        state["preview_revision"] = None
+        state["phase"] = Phase.EDITING.value
+        state["can_confirm"] = False
+        state["can_cancel"] = True
+        return self._finish(state, text, "已选择岗位，请说明要修改的字段或原文条目。")
+
+    def _find_target(self, state: AgentState, query: str, action: str, text: str) -> AgentState:
+        rows = self.repository.search(query)
+        state["pending_action"] = action
+        state["can_cancel"] = True
+        if not rows:
+            return self._finish(state, text, "没有找到对应岗位，请补充公司名称或完整岗位名称。")
+        state["candidates"] = rows
+        if len(rows) == 1:
+            return self._select(state, 1, text)
+        options = "\n".join(
+            f"{index}. 公司：{row.get('company_name')}；岗位：{row.get('title')}；城市：{row.get('city')}"
+            for index, row in enumerate(rows, 1)
+        )
+        return self._finish(state, text, f"找到多个岗位，请选择：\n{options}")
+
+    def _confirm(self, state: AgentState, text: str) -> AgentState:
+        if not state.get("can_confirm"):
+            return self._finish(state, text, "当前没有等待确认的写入操作。")
+        if state.get("preview_revision") != state.get("draft_revision"):
+            state["can_confirm"] = False
+            return self._finish(state, text, "草稿已变化，请先查看最新预览后再确认。")
+        action = state.get("pending_action")
+        if action == "create":
+            missing = missing_create_fields(state.get("draft", {}))
+            if missing:
+                return self._draft_response(state, text)
+            row = self.repository.create(state["draft"])
+            message = f"已保存岗位：{row.get('company_name')} - {row.get('title')}。"
+        elif action == "update" and state.get("target_id"):
+            current = _row_draft(self.repository.get(state["target_id"]))
+            clear_fields = [field for field in current if field not in state.get("draft", {})]
+            _, row = self.repository.update(state["target_id"], state["draft"], clear_fields)
+            message = f"已更新岗位：{row.get('company_name')} - {row.get('title')}。"
+        elif action == "delete" and state.get("target_id"):
+            row = self.repository.delete(state["target_id"])
+            message = f"已删除岗位：{row.get('company_name')} - {row.get('title')}。"
+        else:
+            return self._finish(state, text, "当前没有可执行的确认操作。")
+        return _reset(message)
+
+    def _query(self, state: AgentState, text: str, plan: QueryPlan) -> AgentState:
+        filters = plan.filters()
+        if plan.mode == "count":
+            count = self.repository.count(filters)
+            return self._finish(state, text, f"当前共有 {count} 条岗位记录。")
+        if plan.mode == "list":
+            rows = self.repository.list_summaries(filters, plan.limit)
+            if not rows:
+                return self._finish(state, text, "没有找到符合条件的岗位记录。")
+            lines = [
+                f"{index}. 公司：{row.get('company_name')}；岗位：{row.get('title')}；城市：{row.get('city')}"
+                for index, row in enumerate(rows, 1)
+            ]
+            return self._finish(state, text, "\n".join(lines))
+        ids = self.repository.find_job_ids(filters, plan.limit)
+        if not ids:
+            return self._finish(state, text, "没有找到符合条件的岗位记录。")
+        if len(ids) > 1:
+            rows = self.repository.list_summaries(filters, plan.limit)
+            lines = [
+                f"{index}. 公司：{row.get('company_name')}；岗位：{row.get('title')}；城市：{row.get('city')}"
+                for index, row in enumerate(rows, 1)
+            ]
+            return self._finish(state, text, "找到多条记录，请补充条件后查看详情：\n" + "\n".join(lines))
+        return self._finish(state, text, _render_query_detail(self.repository.get_public_detail(ids[0])))
+
+    def _evaluate_patch(
+        self, command: StructuredCommand, text: str, before_draft: dict[str, Any],
+        before_provenance: dict[str, Any], mentioned_fields: list[str] | None = None,
+    ) -> tuple[DraftPatch, dict[str, Any], dict[str, Any], list[str]]:
+        patch = normalize_patch(command.patch, text)
+        declared = mentioned_fields if mentioned_fields is not None else command.mentioned_fields
+        touched = (
+            set(patch.set_fields) | set(patch.append_items) | set(patch.remove_items)
+            | set(patch.clear_fields) | {item.field for item in patch.replace_items}
+        )
+        mentioned = list(dict.fromkeys([*declared, *sorted(touched)]))
+        patch = sanitize_model_patch(
+            patch, text, mentioned, command.evidence_spans, command.ignored_fragments,
+        )
+        after_draft, after_provenance = apply_draft_patch(before_draft, before_provenance, patch)
+        failures = unapplied_fields(before_draft, after_draft, patch, mentioned)
+        return patch, after_draft, after_provenance, failures
+
+    def _apply_with_retry(
+        self, state: AgentState, command: StructuredCommand, text: str,
+    ) -> tuple[AgentState, StructuredCommand, DraftPatch] | AgentState:
+        before_draft = deepcopy(state.get("draft", {}))
+        before_provenance = deepcopy(state.get("provenance", {}))
+        patch, after, provenance, failures = self._evaluate_patch(
+            command, text, before_draft, before_provenance,
+        )
+        used_command = command
+        if failures:
+            retry_context = build_context(state)
+            retry_context["retry"] = {
+                "reason": "mentioned_fields_not_applied", "unapplied_fields": failures,
+                "instruction": "重新抽取本轮原文，必须返回能落实这些字段的 patch 和 evidence。",
+            }
+            try:
+                retry = self.interpreter.extract(text, retry_context)
+                patch, after, provenance, failures = self._evaluate_patch(
+                    retry, text, before_draft, before_provenance, command.mentioned_fields,
+                )
+                used_command = retry
+            except (LLMConfigurationError, LLMServiceError, ValidationError):
+                pass
+        if failures:
+            state["draft"] = before_draft
+            state["provenance"] = before_provenance
+            state["can_confirm"] = False
+            state["preview_revision"] = None
+            labels = "、".join(FIELD_LABELS.get(field, field) for field in failures)
+            return self._finish(
+                state, text, f"本轮字段未成功应用，尚未保存。未应用字段：{labels}。",
+            )
+        changes = changed_fields(before_draft, after)
+        state["draft"] = after
+        state["provenance"] = provenance
+        if changes:
+            state["draft_revision"] = state.get("draft_revision", 0) + 1
+        state["preview_revision"] = None
+        return state, used_command, patch
 
     def handle(
-        self, state: AgentState | None, text: str, forced_command: dict[str, Any] | None = None,
+        self, state: AgentState, text: str, forced_command: dict[str, Any] | None = None,
     ) -> AgentState:
-        current = {**initial_state(), **(state or {})}
-        stripped = text.strip()
-        if forced_command is None and stripped.startswith("{"):
-            try:
-                forced_command = _draft_json_command(stripped, current.get("phase", Phase.IDLE.value)).model_dump(mode="json")
-            except ValueError as exc:
-                return {
-                    **current, **_clean_turn(),
-                    "message": f"JSON 格式错误：{exc}。原岗位草稿已保留，请修正后重新发送。",
-                }
-        current.update({"user_input": stripped, "forced_command": forced_command})
-        return self.graph.invoke(current)
+        current: AgentState = deepcopy(state)
+        text = " ".join(text.split())
 
-    def _command(self, state: AgentState) -> StructuredCommand:
-        if state.get("forced_command") is not None:
-            return StructuredCommand.model_validate(state["forced_command"])
-        text = state.get("user_input", "").strip()
-        normalized = text.casefold().replace(" ", "")
-        if normalized in {"确认", "确认写入", "yes", "ok"}:
-            return StructuredCommand(intent="confirm")
-        if normalized in {"取消", "放弃", "不要了", "cancel"}:
-            return StructuredCommand(intent="cancel")
-        if normalized.isdigit():
-            return StructuredCommand(intent="unknown", selection_index=int(normalized))
-        context = {
-            "phase": state.get("phase"),
-            "draft": state.get("draft", {}),
-            "target_id": state.get("target_id"),
-            "candidate_count": len(state.get("candidates", [])),
-            "pending_action": state.get("pending_action"),
-        }
+        if forced_command:
+            if forced_command.get("intent") == "confirm":
+                return self._confirm(current, text)
+            if forced_command.get("intent") == "cancel":
+                return _reset("已取消当前操作，未写入任何数据。")
+            if forced_command.get("selection_index") is not None:
+                return self._select(current, int(forced_command["selection_index"]), text)
+
+        if _AFFIRMATIVE_RE.fullmatch(text):
+            pending = current.get("pending_decision")
+            if pending:
+                patch = DraftPatch.model_validate(pending["patch"])
+                before = deepcopy(current.get("draft", {}))
+                draft, provenance = apply_draft_patch(
+                    before, current.get("provenance", {}), patch,
+                )
+                current["draft"] = draft
+                current["provenance"] = provenance
+                if changed_fields(before, draft):
+                    current["draft_revision"] = current.get("draft_revision", 0) + 1
+                mentioned = list(pending.get("mentioned_fields", []))
+                current["pending_decision"] = None
+                current["preview_revision"] = None
+                return self._draft_response(
+                    current, text, update_summary=_update_summary(patch, mentioned),
+                )
+            return self._confirm(current, text)
+        if _NEGATIVE_RE.fullmatch(text) and current.get("pending_decision"):
+            current["pending_decision"] = None
+            return self._draft_response(current, text)
+        if text in {"取消", "取消操作", "算了"}:
+            return _reset("已取消当前操作，未写入任何数据。")
+        if re.search(r"(?:现在|当前).*(?:字段|草稿)|字段是什么", text):
+            return self._show_current(current, text)
+
+        context = build_context(current)
         try:
-            command = guard_model_command(self.interpreter.extract(text, context), text)
-        except (LLMConfigurationError, LLMServiceError, ValidationError, ValueError, RuntimeError) as exc:
-            return StructuredCommand(
-                intent="unsupported",
-                route={
-                    "category": RouteCategory.UNSUPPORTED,
-                    "action": "unsupported",
-                    "confidence": 0.0,
-                    "reason": "model_unavailable",
-                },
-                confidence=0.0,
-                natural_reply=(
-                    "我现在暂时无法可靠理解这段岗位信息，因此没有修改任何字段。"
-                    "现有草稿已保留，请稍后重试。"
-                ),
-            )
-        route = resolve_route(command, text)
-        if state.get("phase") == Phase.CREATING.value and route.category == RouteCategory.JOB_WRITE:
-            # A new create-like continuation extends the active draft; it does not silently
-            # replace it. Explicit update/delete operations retain their locating query.
-            if (
-                command.intent == "create"
-                and command.task_relation != "start_new"
-            ) or (command.intent == "update" and not command.search_query):
-                command = command.model_copy(update={"intent": "update", "search_query": None})
-        return command
+            command = self.interpreter.extract(text, context)
+        except (LLMConfigurationError, LLMServiceError) as exc:
+            return self._finish(current, text, str(exc))
+        except ValidationError as exc:
+            return self._finish(current, text, f"模型返回的结构化结果无效，草稿已保留：{exc}")
 
-    @staticmethod
-    def _clarification_result(command: StructuredCommand) -> AgentState | None:
-        route_confidence = command.route.confidence if command.route is not None else 1.0
-        if not command.requires_clarification and min(command.confidence, route_confidence) >= 0.75:
-            return None
-        message = command.natural_reply or (
-            command.clarification_questions[0]
-            if command.clarification_questions
-            else "我还不能可靠判断你的意思，请再具体说明想处理的岗位和动作。"
-        )
-        return {**_clean_turn(), "message": message}
-
-    @staticmethod
-    def _missing(draft: dict[str, Any]) -> list[str]:
-        missing = [field for field in REQUIRED_CREATE_FIELDS if not draft.get(field)]
-        if not any(draft.get(field) for field in CREATE_CONTENT_FIELDS):
-            missing.append("job_content")
-        return missing
-
-    def _conversation_reply(
-        self, state: AgentState, text: str, *, help_request: bool = False,
-        command: StructuredCommand | None = None,
-    ) -> AgentState:
-        draft = state.get("pending_fields", {}) or state.get("draft", {})
-        important = state.get("missing_important_fields", []) or _important_missing(draft)
-        title = draft.get("title")
-        company = draft.get("company_name")
-        draft_summary = " - ".join(item for item in (company, title) if item) or None
-        context = {
-            "phase": state.get("phase", Phase.IDLE.value),
-            "draft_summary": draft_summary,
-            "missing_labels": important,
-        }
-        message = (command.natural_reply or "").strip() if command is not None else ""
-        responder = getattr(self.interpreter, "respond_to_conversation", None)
-        if callable(responder):
-            try:
-                message = str(responder(text, context)).strip()
-            except Exception:
-                message = ""
-        if not message:
-            if help_request:
-                message = (
-                    "我是招聘岗位助手，可以查询、筛选和统计现有岗位，也可以整理 JD，"
-                    "协助新增、修改或删除岗位；所有写入都要经过你的明确确认。"
-                )
-            else:
-                message = "你好！我在。你可以直接描述想查询的岗位，或把一份 JD 发给我整理。"
-            if draft:
-                task = draft_summary or "尚未命名的岗位"
-                message += f" 当前正在处理“{task}”，草稿已保留。"
-                if important:
-                    message += f" 接下来最值得补充的是：{important[0]}。"
-        return {**_clean_turn(), "message": message}
-
-    @staticmethod
-    def _unsupported_reply(message: str | None = None) -> AgentState:
-        return {
-            **_clean_turn(),
-            "message": message or (
-                "这件事超出了当前岗位管理范围。我可以继续帮你查询统计岗位、整理 JD，"
-                "或准备需要确认的新增、修改和删除操作。"
-            ),
-        }
-
-    def _creation_result(
-        self,
-        draft: dict[str, Any],
-        changed: dict[str, Any],
-        semantic_facts: list[dict[str, Any]],
-        clarification_questions: list[str],
-        previous_state: AgentState | None = None,
-        user_input: str = "",
-    ) -> AgentState:
-        previous_state = previous_state or initial_state()
-        draft = normalize_job_fields(draft)
-        missing = self._missing(draft)
-        important_missing = _important_missing(draft)
-        all_questions = list(dict.fromkeys([
-            *clarification_questions, *_priority_questions(draft, []),
-        ]))
-        unresolved = list(all_questions)
-        display_questions = unresolved[:1]
-        asked = list(display_questions)
-        recognized = (
-            f"我已记下：\n{_field_lines(changed)}"
-            if changed else "岗位草稿没有被改动。"
-        )
-        notes, grouped_suggestions = _semantic_notes(
-            draft, semantic_facts,
-            [question for question in display_questions if question in clarification_questions],
-            previous_state.get("dismissed_suggestions", []),
-        )
-        review = semantic_review(
-            draft, [SemanticFact.model_validate(item) for item in semantic_facts],
-        )
-        warnings = [item.message for item in review if item.level == "warning"]
-        blocking = [item.message for item in review if item.level == "blocking"]
-        review_section = ""
-        if warnings or blocking:
-            review_section = "\n\n语义检查：\n" + "\n".join(
-                f"- {item}" for item in [*blocking, *warnings]
-            )
-        question_state = {
-            "clarification_questions": clarification_questions,
-            "unanswered_questions": unresolved,
-            "asked_questions": asked,
-            "pending_suggestions": grouped_suggestions,
-            "dismissed_suggestions": previous_state.get("dismissed_suggestions", []),
-            "missing_important_fields": important_missing,
-            "incomplete_warning_acknowledged": False,
-            "coverage": previous_state.get("coverage", []),
-        }
-        if missing:
-            labels = "、".join(FIELD_LABELS.get(field, field) for field in missing)
-            return {
-                **_clean_turn(), "phase": Phase.CREATING.value, "draft": draft,
-                "semantic_facts": semantic_facts,
-                **question_state,
-                "missing_fields": missing, "can_confirm": False, "can_cancel": True,
-                "message": f"{recognized}{notes}{review_section}\n\n接下来请补充：{labels}。",
-            }
-        missing_section = (
-            "\n\n仍未填写的重要信息：\n"
-            + "\n".join(f"- {item}" for item in important_missing)
-            + "\n\n您可以继续补充，也可以按当前内容保存；保存前我会再提醒一次。"
-            if important_missing else ""
-        )
-        return {
-            **_clean_turn(), "phase": Phase.CONFIRMING.value, "draft": draft,
-            "pending_action": "create", "pending_fields": draft, "pending_clear_fields": [],
-            "semantic_facts": semantic_facts,
-            **question_state,
-            "pending_semantic_facts": semantic_facts,
-            "missing_fields": [], "can_confirm": True, "can_cancel": True,
-            "message": (
-                "岗位内容已整理完成，下面是写入前预览：\n```json\n"
-                f"{_preview_json(draft)}\n```\n\n"
-                "如果需要修改，可以复制上方 JSON，编辑后直接发送给我。"
-                f"{notes}{review_section}{missing_section}"
-            ),
-        }
-
-    def _idle(self, state: AgentState) -> AgentState:
-        command = self._command(state)
-        clarification = self._clarification_result(command)
-        if clarification is not None:
-            return clarification
-        route = resolve_route(command, state.get("user_input", ""))
-        if route.category == RouteCategory.HELP:
-            return self._conversation_reply(
-                state, state.get("user_input", ""), help_request=True, command=command,
-            )
-        if route.category == RouteCategory.CONVERSATION:
-            return self._conversation_reply(state, state.get("user_input", ""), command=command)
-        if route.category == RouteCategory.UNSUPPORTED:
-            return self._unsupported_reply(command.natural_reply)
-        if route.category == RouteCategory.JOB_READ:
-            return self._run_search(state.get("user_input", ""))
-        fields = command.fields.model_dump(exclude_none=True)
-        if command.intent == "create":
-            facts = _merge_facts([], command.semantic_facts)
-            return self._creation_result(
-                fields, fields, facts, command.clarification_questions,
-                {**state, "coverage": [item.model_dump(mode="json") for item in command.coverage]},
-                state.get("user_input", ""),
-            )
-        if command.intent in {"update", "delete"}:
-            return self._locate_for_edit(command)
-        return {
-            **_clean_turn(),
-            "message": "我还没理解这次想处理什么。你可以描述岗位查询，或说明要新建、修改、删除哪个岗位。",
-        }
-
-    def _run_search(self, text: str) -> AgentState:
-        if self.query_adapter is None:
-            return {**_clean_turn(), "message": "岗位查询暂时不可用，请稍后再试。"}
-        result = self.query_adapter.ask(text)
-        kind = result.get("kind")
-        if result.get("needs_clarification") or kind == QueryResultKind.CLARIFICATION.value:
-            return {**_clean_turn(), "message": result.get("message") or "请补充想查找的公司或岗位。"}
-        if kind == QueryResultKind.SCALAR.value:
-            value = result.get("scalar_value")
-            name = result.get("scalar_name")
-            if name == "job_count":
-                return {**_clean_turn(), "message": f"当前共有 {value} 条岗位记录。"}
-            return {**_clean_turn(), "message": f"查询结果为 {value}。"}
-        rows = result.get("rows", [])
-        if not rows:
-            return {**_clean_turn(), "message": "没有找到对应岗位，请检查公司名称或岗位名称是否准确。"}
-        sections: list[str] = []
-        for index, row in enumerate(rows, 1):
-            visible = {
-                key: value for key, value in row.items()
-                if key in FIELD_LABELS and key not in {"job_id"} and value not in (None, "", [], "[]")
-            }
-            sections.append(f"{index}.\n{_field_lines(visible)}")
-        if kind == QueryResultKind.DETAIL.value:
-            return {**_clean_turn(), "message": "岗位详情：\n\n" + sections[0]}
-        return {**_clean_turn(), "message": f"找到 {len(rows)} 个岗位：\n\n" + "\n\n".join(sections)}
-
-    def _creating(self, state: AgentState) -> AgentState:
-        command = self._command(state)
-        clarification = self._clarification_result(command)
-        if clarification is not None:
-            return clarification
-        route = resolve_route(command, state.get("user_input", ""))
-        if route.category == RouteCategory.HELP:
-            return self._conversation_reply(
-                state, state.get("user_input", ""), help_request=True, command=command,
-            )
-        if route.category == RouteCategory.CONVERSATION:
-            return self._conversation_reply(state, state.get("user_input", ""), command=command)
-        if route.category == RouteCategory.UNSUPPORTED:
-            return self._unsupported_reply(command.natural_reply)
-        if route.category == RouteCategory.JOB_READ:
-            return self._run_search(state.get("user_input", ""))
-        if command.intent == "cancel":
-            return _reset("已取消新建，内容未保存。")
-        if command.intent in {"update", "delete"} and command.search_query:
-            return self._locate_for_edit(command)
-        changed = command.fields.model_dump(exclude_none=True)
-        starts_new = command.intent == "create" and command.task_relation == "start_new"
-        draft = {} if starts_new else dict(state.get("draft", {}))
-        draft.update(changed)
-        for field in command.clear_fields:
-            draft.pop(field, None)
-        facts = _merge_facts(
-            [] if starts_new else state.get("semantic_facts", []), command.semantic_facts,
-        )
-        # The model sees the full draft/context and returns only currently unresolved
-        # questions.  Deterministic code must not guess whether a semantic question
-        # was answered from keywords in the latest turn.
-        questions = list(command.clarification_questions)
-        return self._creation_result(
-            draft, changed, facts, questions,
-            {
-                **(initial_state() if starts_new else state),
-                "coverage": [item.model_dump(mode="json") for item in command.coverage]
-                or state.get("coverage", []),
-            },
-            state.get("user_input", ""),
-        )
-
-    def _locate_for_edit(self, command: StructuredCommand) -> AgentState:
-        fields = command.fields.model_dump(exclude_none=True)
-        query = (command.search_query or "").strip()
-        if not query:
-            query = " ".join(str(fields.get(key, "")) for key in ("company_name", "title")).strip()
-        if not query:
-            action_text = "删除" if command.intent == "delete" else "修改"
-            return {
-                **_clean_turn(), "phase": Phase.EDITING.value, "can_cancel": True,
-                "message": f"请告诉我您想{action_text}的是哪家公司、哪个岗位。",
-            }
-        candidates = self.repository.search(query)
-        if not candidates:
-            return {
-                **_clean_turn(), "phase": Phase.EDITING.value, "can_cancel": True,
-                "message": "没有找到对应岗位，请检查公司名称或岗位名称是否准确。",
-            }
-        pending = {
-            "pending_action": "delete" if command.intent == "delete" else "update",
-            "pending_fields": fields,
-            "pending_clear_fields": command.clear_fields,
-            "pending_semantic_facts": [
-                fact.model_dump(mode="json") for fact in command.semantic_facts
-            ],
-        }
-        if len(candidates) == 1:
-            return self._selected(candidates[0], pending)
-        lines = "\n".join(
-            f"[{index}] {row['company_name']} - {row['title']}"
-            for index, row in enumerate(candidates, 1)
-        )
-        return {
-            **_clean_turn(), **pending, "phase": Phase.EDITING.value,
-            "candidates": candidates, "can_cancel": True,
-            "message": f"找到多个候选岗位，请输入序号或点击按钮选择：\n{lines}",
-        }
-
-    def _selected(self, row: dict[str, str], pending: dict[str, Any]) -> AgentState:
-        action = pending.get("pending_action", "update")
-        fields = pending.get("pending_fields", {})
-        clear_fields = pending.get("pending_clear_fields", [])
-        semantic_facts = pending.get("pending_semantic_facts", [])
-        base = {
-            **_clean_turn(), "target_id": row["job_id"], "candidates": [],
-            "pending_action": action, "pending_fields": fields,
-            "pending_clear_fields": clear_fields, "can_cancel": True,
-            "pending_semantic_facts": semantic_facts,
-        }
-        if action == "delete":
-            return {
-                **base, "phase": Phase.CONFIRMING.value, "can_confirm": True,
-                "message": (
-                    "请确认删除以下岗位：\n"
-                    f"- {row['company_name']} - {row['title']}"
-                ),
-            }
-        if not fields and not clear_fields:
-            return {
-                **base, "phase": Phase.EDITING.value, "pending_action": None,
-                "message": f"已锁定 {row['company_name']} - {row['title']}。请告诉我要修改哪些字段。",
-            }
-        return self._update_preview(row, fields, clear_fields, semantic_facts)
-
-    def _update_preview(
-        self, row: dict[str, str], fields: dict[str, Any], clear_fields: list[str],
-        semantic_facts: list[dict[str, Any]] | None = None,
-    ) -> AgentState:
-        lines: list[str] = []
-        for field, value in fields.items():
-            lines.append(
-                f"- {FIELD_LABELS.get(field, field)}：{_display_value(field, row.get(field))} ➔ {_display_value(field, value)}"
-            )
-        for field in clear_fields:
-            lines.append(f"- {FIELD_LABELS.get(field, field)}：{_display_value(field, row.get(field))} ➔ （清空）")
-        candidate = _row_draft(row)
-        candidate.update(fields)
-        for field in clear_fields:
-            candidate.pop(field, None)
-        candidate = normalize_job_fields(candidate)
-        review = semantic_review(
-            candidate,
-            [SemanticFact.model_validate(item) for item in semantic_facts or []],
-        )
-        blocking = [item.message for item in review if item.level == "blocking"]
-        warnings = [item.message for item in review if item.level == "warning"]
-        review_section = ""
-        if blocking or warnings:
-            review_section = "\n\n语义检查：\n" + "\n".join(
-                f"- {item}" for item in [*blocking, *warnings]
-            )
-        return {
-            **_clean_turn(), "phase": Phase.CONFIRMING.value, "target_id": row["job_id"],
-            "candidates": [], "pending_action": "update", "pending_fields": fields,
-            "pending_clear_fields": clear_fields, "can_confirm": not blocking, "can_cancel": True,
-            "pending_semantic_facts": semantic_facts or [],
-            "message": (
-                f"请确认修改：{row['company_name']} - {row['title']}\n"
-                + "\n".join(lines)
-                + "\n\n修改后的岗位信息：\n```json\n"
-                + _preview_json(candidate)
-                + "\n```\n\n如果需要修改，可以复制上方 JSON，编辑后直接发送给我。"
-                + review_section
-            ),
-        }
-
-    def _editing(self, state: AgentState) -> AgentState:
-        command = self._command(state)
-        clarification = self._clarification_result(command)
-        if clarification is not None:
-            return clarification
-        route = resolve_route(command, state.get("user_input", ""))
-        if route.category == RouteCategory.HELP:
-            return self._conversation_reply(
-                state, state.get("user_input", ""), help_request=True, command=command,
-            )
-        if route.category == RouteCategory.CONVERSATION:
-            return self._conversation_reply(state, state.get("user_input", ""), command=command)
-        if route.category == RouteCategory.JOB_READ:
-            return self._run_search(state.get("user_input", ""))
-        if route.category == RouteCategory.UNSUPPORTED:
-            return self._unsupported_reply(command.natural_reply)
-        if command.intent == "cancel":
-            return _reset("已取消修改，内容未保存。")
-        candidates = state.get("candidates", [])
-        if candidates:
-            index = command.selection_index
-            if index is None or not 1 <= index <= len(candidates):
-                return {**_clean_turn(), "message": f"请输入 1 到 {len(candidates)} 之间的序号。"}
-            pending = {
-                "pending_action": state.get("pending_action") or "update",
-                "pending_fields": state.get("pending_fields", {}),
-                "pending_clear_fields": state.get("pending_clear_fields", []),
-                "pending_semantic_facts": state.get("pending_semantic_facts", []),
-            }
-            return self._selected(candidates[index - 1], pending)
-        target_id = state.get("target_id")
-        if not target_id:
-            return self._locate_for_edit(command)
-        row = self.repository.get(target_id)
-        if command.intent == "delete":
-            return self._selected(row, {
-                "pending_action": "delete", "pending_fields": {}, "pending_clear_fields": [],
-                "pending_semantic_facts": [],
-            })
-        changed = command.fields.model_dump(exclude_none=True)
-        if not changed and not command.clear_fields:
-            return {**_clean_turn(), "message": "没有识别到要修改的内容，请再具体描述一次。"}
-        fields = dict(state.get("pending_fields", {})) if state.get("pending_action") == "update" else {}
-        fields.update(changed)
-        clears = (
-            list(state.get("pending_clear_fields", []))
-            if state.get("pending_action") == "update" else []
-        )
-        clears = list(dict.fromkeys([*clears, *command.clear_fields]))
-        for key in changed:
-            if key in clears:
-                clears.remove(key)
-        facts = _merge_facts(state.get("pending_semantic_facts", []), command.semantic_facts)
-        return self._update_preview(row, fields, clears, facts)
-
-    def _confirming(self, state: AgentState) -> AgentState:
-        command = self._command(state)
-        clarification = self._clarification_result(command)
-        if clarification is not None:
-            return clarification
-        route = resolve_route(command, state.get("user_input", ""))
-        if route.category == RouteCategory.HELP:
-            return self._conversation_reply(
-                state, state.get("user_input", ""), help_request=True, command=command,
-            )
-        if route.category == RouteCategory.CONVERSATION:
-            return self._conversation_reply(state, state.get("user_input", ""), command=command)
-        if route.category == RouteCategory.JOB_READ:
-            return self._run_search(state.get("user_input", ""))
-        if route.category == RouteCategory.UNSUPPORTED:
-            return self._unsupported_reply(command.natural_reply)
-        if command.intent == "cancel":
-            return _reset("已取消操作，内容未保存。")
-        action = state.get("pending_action")
         if command.intent == "confirm":
-            important_missing = state.get("missing_important_fields", [])
-            if action == "create" and important_missing and not state.get("incomplete_warning_acknowledged"):
-                labels = "、".join(important_missing)
-                return {
-                    **state, **_clean_turn(), "phase": Phase.CONFIRMING.value,
-                    "incomplete_warning_acknowledged": True,
-                    "can_confirm": True, "can_cancel": True,
-                    "message": (
-                        f"保存前提醒：以下重要信息仍未填写：{labels}。\n\n"
-                        "如果确定按当前内容保存，请再次确认；也可以继续补充。"
-                    ),
+            return self._confirm(current, text)
+        if command.intent == "cancel":
+            return _reset("已取消当前操作，未写入任何数据。")
+        if command.intent in {"search", "count", "detail"}:
+            mode = {"count": "count", "detail": "detail"}.get(command.intent, "list")
+            plan = command.query_plan or QueryPlan(mode=mode)
+            if command.intent != "search" and plan.mode != mode:
+                plan = plan.model_copy(update={"mode": mode})
+            return self._query(current, text, plan)
+        if command.intent == "delete":
+            return self._find_target(current, command.search_query or text, "delete", text)
+        if command.intent == "update" and current.get("pending_action") not in {"create", "update"}:
+            if command.search_query:
+                return self._find_target(current, command.search_query, "update", text)
+        if command.intent in {"help", "conversation", "unsupported", "unknown"}:
+            return self._finish(
+                current, text,
+                command.natural_reply or "我可以继续补充当前草稿，或查询、修改已有岗位。",
+            )
+
+        if command.intent == "create":
+            if current.get("pending_action") != "create" or command.task_relation == "start_new":
+                current = initial_state()
+            current["pending_action"] = "create"
+            current["phase"] = Phase.CREATING.value
+        elif command.intent != "update" or current.get("pending_action") not in {"create", "update"}:
+            return self._finish(current, text, "请说明要新增、修改或查询的岗位。")
+
+        current["pending_decision"] = None
+        applied = self._apply_with_retry(current, command, text)
+        if isinstance(applied, dict):
+            return applied
+        current, used_command, patch = applied
+        if used_command.pending_decision is not None:
+            decision_patch = normalize_patch(used_command.pending_decision.patch, text)
+            decision_patch = sanitize_model_patch(
+                decision_patch, text, used_command.mentioned_fields,
+                used_command.evidence_spans, used_command.ignored_fragments,
+            )
+            if (
+                decision_patch.set_fields or decision_patch.append_items
+                or decision_patch.replace_items or decision_patch.remove_items
+                or decision_patch.clear_fields
+            ):
+                current["pending_decision"] = {
+                    **used_command.pending_decision.model_dump(mode="json"),
+                    "patch": decision_patch.model_dump(mode="json"),
+                    "mentioned_fields": used_command.mentioned_fields,
                 }
-            if action == "create":
-                row = self.repository.create(
-                    state.get("pending_fields", {}),
-                    state.get("pending_semantic_facts", []),
-                )
-                message = f"已保存新岗位：{row['company_name']} - {row['title']}。"
-            elif action == "update":
-                _, row = self.repository.update(
-                    state.get("target_id") or "", state.get("pending_fields", {}),
-                    state.get("pending_clear_fields", []),
-                    state.get("pending_semantic_facts", []),
-                )
-                message = f"已更新岗位：{row['company_name']} - {row['title']}。"
-            elif action == "delete":
-                row = self.repository.delete(state.get("target_id") or "")
-                message = f"已删除岗位：{row['company_name']} - {row['title']}。"
-            else:
-                return _reset("没有待确认的操作。")
-            if self.query_adapter is not None:
-                try:
-                    self.query_adapter.rebuild()
-                    message += " 岗位查询数据已同步。"
-                except Exception:  # The save succeeded; never invite a duplicate retry.
-                    message += " 岗位已保存，但查询服务暂时未同步，请联系管理员。"
-            return _reset(message)
-        if command.intent == "update":
-            changed = command.fields.model_dump(exclude_none=True)
-            if not changed and not command.clear_fields:
-                phase = Phase.CREATING.value if action == "create" else Phase.EDITING.value
-                return {
-                    **_clean_turn(), "phase": phase, "pending_action": action,
-                    "draft": state.get("pending_fields", {}) if action == "create" else state.get("draft", {}),
-                    "semantic_facts": state.get("pending_semantic_facts", []),
-                    "clarification_questions": state.get("clarification_questions", []),
-                    "unanswered_questions": state.get("unanswered_questions", []),
-                    "asked_questions": state.get("asked_questions", []),
-                    "pending_suggestions": state.get("pending_suggestions", []),
-                    "missing_important_fields": state.get("missing_important_fields", []),
-                    "incomplete_warning_acknowledged": False,
-                    "can_confirm": False, "message": "好的，请继续告诉我要调整哪些字段。",
-                }
-            if action == "create":
-                draft = dict(state.get("pending_fields", {}))
-                draft.update(changed)
-                for field in command.clear_fields:
-                    draft.pop(field, None)
-                facts = _merge_facts(state.get("pending_semantic_facts", []), command.semantic_facts)
-                questions = list(command.clarification_questions)
-                return self._creation_result(
-                    draft, changed, facts, questions, state, state.get("user_input", ""),
-                )
-            if action == "update":
-                fields = dict(state.get("pending_fields", {}))
-                fields.update(changed)
-                clears = list(dict.fromkeys([*state.get("pending_clear_fields", []), *command.clear_fields]))
-                for key in changed:
-                    if key in clears:
-                        clears.remove(key)
-                row = self.repository.get(state.get("target_id") or "")
-                facts = _merge_facts(state.get("pending_semantic_facts", []), command.semantic_facts)
-                return self._update_preview(row, fields, clears, facts)
-        return {
-            **_clean_turn(), "message": "当前正在等待确认。请选择“确认写入”“取消”或“继续修改”。",
-        }
+        clarification = used_command.clarification_question if used_command.requires_clarification else None
+        return self._draft_response(
+            current, text, clarification,
+            update_summary=_update_summary(patch, command.mentioned_fields),
+        )

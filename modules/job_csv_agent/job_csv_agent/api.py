@@ -28,13 +28,27 @@ class InMemorySessionStore:
             self._states[session_id] = state
             return session_id, state
 
-    def apply(self, session_id: str, callback: Any) -> AgentState:
+    def apply(
+        self, session_id: str, callback: Any, expected_version: int | None = None,
+    ) -> AgentState:
         with self._lock:
             if session_id not in self._states:
                 raise KeyError(session_id)
-            state = callback(self._states[session_id])
+            current = self._states[session_id]
+            version = int(current.get("state_version", 0))
+            if expected_version is not None and expected_version != version:
+                raise StateConflictError(expected_version, version)
+            state = callback(current)
+            state["state_version"] = version + 1
             self._states[session_id] = state
             return state
+
+
+class StateConflictError(RuntimeError):
+    def __init__(self, expected: int, actual: int) -> None:
+        super().__init__(f"会话状态已变化：请求版本 {expected}，当前版本 {actual}")
+        self.expected = expected
+        self.actual = actual
 
 
 def _response(session_id: str, state: AgentState) -> ChatResponse:
@@ -51,6 +65,7 @@ def _response(session_id: str, state: AgentState) -> ChatResponse:
         ],
         can_confirm=state.get("can_confirm", False),
         can_cancel=state.get("can_cancel", False),
+        state_version=state.get("state_version", 0),
     )
 
 
@@ -74,11 +89,27 @@ def create_app(agent: JobCsvAgent | None = None) -> FastAPI:
         session_id, state = sessions.create()
         return _response(session_id, state)
 
-    def run(session_id: str, text: str, forced: dict[str, Any] | None = None) -> ChatResponse:
+    def run(
+        session_id: str,
+        text: str,
+        forced: dict[str, Any] | None = None,
+        expected_version: int | None = None,
+    ) -> ChatResponse:
         try:
-            state = sessions.apply(session_id, lambda current: service.handle(current, text, forced))
+            state = sessions.apply(
+                session_id, lambda current: service.handle(current, text, forced), expected_version,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="session 不存在") from exc
+        except StateConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "会话已被另一条消息更新，请等待上一条回复后重试。",
+                    "expected_version": exc.expected,
+                    "current_version": exc.actual,
+                },
+            ) from exc
         except LLMConfigurationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except LLMServiceError as exc:
@@ -100,21 +131,26 @@ def create_app(agent: JobCsvAgent | None = None) -> FastAPI:
 
     @app.post("/sessions/{session_id}/messages", response_model=ChatResponse)
     def message(session_id: str, request: ChatRequest) -> ChatResponse:
-        return run(session_id, request.content)
+        return run(session_id, request.content, expected_version=request.expected_version)
 
     @app.post("/sessions/{session_id}/confirm", response_model=ChatResponse)
-    def confirm(session_id: str) -> ChatResponse:
-        return run(session_id, "确认写入", {"intent": "confirm"})
+    def confirm(session_id: str, expected_version: int) -> ChatResponse:
+        return run(
+            session_id, "确认写入", {"intent": "confirm"}, expected_version=expected_version,
+        )
 
     @app.post("/sessions/{session_id}/cancel", response_model=ChatResponse)
-    def cancel(session_id: str) -> ChatResponse:
-        return run(session_id, "取消", {"intent": "cancel"})
+    def cancel(session_id: str, expected_version: int | None = None) -> ChatResponse:
+        return run(session_id, "取消", {"intent": "cancel"}, expected_version=expected_version)
 
     @app.post("/sessions/{session_id}/select/{selection_index}", response_model=ChatResponse)
-    def select(session_id: str, selection_index: int) -> ChatResponse:
+    def select(
+        session_id: str, selection_index: int, expected_version: int | None = None,
+    ) -> ChatResponse:
         return run(
             session_id, str(selection_index),
             {"intent": "unknown", "selection_index": selection_index},
+            expected_version=expected_version,
         )
 
     return app
