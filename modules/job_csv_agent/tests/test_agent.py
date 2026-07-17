@@ -74,6 +74,7 @@ def test_edit_disambiguates_then_confirms(tmp_path: Path) -> None:
         "salary_min": 21_000,
     })
     interpreter = FakeInterpreter({
+        "修改 Python 岗位": {"intent": "update", "search_query": "Python 岗位"},
         "薪资调整为25000到30000": {
             "intent": "update", "fields": {"salary_min": 25_000, "salary_max": 30_000},
         },
@@ -118,12 +119,16 @@ def test_create_with_responsibility_only_and_inferred_suggestions(tmp_path: Path
     interpreter = FakeInterpreter({
         "请创建示例科技的大模型工程师，职责是从0开始预训练大模型": {
             "intent": "create",
-            "fields": {
-                "company_name": "示例科技", "title": "大模型工程师",
-                # Simulate the historical model error. The deterministic semantic layer repairs it.
-                "requirements_json": ["从0开始预训练大模型"],
+                "fields": {
+                    "company_name": "示例科技", "title": "大模型工程师",
+                    "responsibilities_json": ["从0开始预训练大模型"],
+                },
+                "semantic_facts": [{
+                    "value": "从0开始预训练大模型", "category": "responsibility",
+                    "importance": "neutral", "source_type": "explicit",
+                    "evidence_text": "从0开始预训练大模型",
+                }],
             },
-        },
     })
     agent = JobCsvAgent(repository, interpreter)
 
@@ -131,8 +136,6 @@ def test_create_with_responsibility_only_and_inferred_suggestions(tmp_path: Path
     assert state["phase"] == Phase.CONFIRMING.value
     assert state["pending_fields"].get("requirements_json") is None
     assert state["pending_fields"]["responsibilities_json"] == ["从0开始预训练大模型"]
-    assert "确认前不会写入岗位草稿" in state["message"]
-    assert "从零训练基础模型" in state["message"]
     assert row_count(path) == 0
 
     state = agent.handle(state, "确认写入", {"intent": "confirm"})

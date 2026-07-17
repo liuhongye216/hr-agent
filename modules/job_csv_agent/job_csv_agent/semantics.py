@@ -1,10 +1,22 @@
+"""Legacy compatibility helpers.
+
+The runtime agent and repository deliberately do not import this module.  Its old
+rule-based language helpers remain only for migration/regression consumers and must
+not be reintroduced into routing, field extraction, JD classification or rewriting.
+New deterministic safety checks live in :mod:`job_csv_agent.guards`.
+"""
+
 from __future__ import annotations
 
 import re
 from collections.abc import Iterable
 from typing import Any
 
-from .schemas import JobFields, RewriteResult, SemanticFact, SemanticIssue, StructuredCommand
+from .jd_sections import has_jd_structure, parse_jd_sections
+from .schemas import (
+    ConstrainedRewriteBatch, CoverageItem, JDAnalysis, JobFields, RewriteResult, SemanticFact,
+    SemanticIssue, StructuredCommand,
+)
 
 
 SEMANTIC_FIELD_BY_CATEGORY = {
@@ -24,7 +36,8 @@ _QUALIFICATION_RE = re.compile(
     re.IGNORECASE,
 )
 _RESPONSIBILITY_START_RE = re.compile(
-    r"^(?:负责|参与|完成|开展|推动|跟进|维护|搭建|交付|承担|制定|建设|实现|使用|基于|"
+    r"^(?:负责|参与|协助|支持|完成|开展|推动|推进|跟进|维护|搭建|交付|承担|制定|建设|实现|使用|基于|"
+    r"组织|主导|配合|研究|分析|构建|迭代|设计|开发|"
     r"从(?:0|零)开始|预训练|训练|评估|部署|优化)(?:\s|[\u4e00-\u9fffA-Za-z0-9])",
     re.IGNORECASE,
 )
@@ -162,7 +175,14 @@ def split_atomic_clauses(text: str) -> list[str]:
         piece = re.sub(r"^\s*(?:\d{1,2}[、.．)）-]\s*)?", "", piece).strip()
         if not piece:
             continue
-        candidates = re.split(
+        # A coordinated predicate group sharing one object must remain intact, e.g.
+        # “训练环境的设计、搭建与迭代”; the latter two verbs are not standalone duties.
+        shared_object_group = re.search(
+            r"的[^，。；]{0,40}(?:设计|开发|建设)、(?:搭建|开发|建设|迭代|优化)(?:与|和|及)"
+            r"(?:迭代|优化|维护|建设)",
+            piece,
+        )
+        candidates = [piece] if shared_object_group else re.split(
             r"[，、](?=\s*(?:具有|具备|熟悉|掌握|了解|能够|经验|能力|意识|学历|证书|优先|"
             r"负责|参与|完成|开展|推动|跟进|维护|搭建|交付|使用|基于|有.+经验|学习能力强|"
             r"基础扎实|扎实的|对代码|重视))",
@@ -199,7 +219,9 @@ def looks_like_qualification(value: str) -> bool:
 
 def looks_like_responsibility(value: str) -> bool:
     cleaned = clean_text(value)
-    return bool(_RESPONSIBILITY_START_RE.match(cleaned)) and not looks_like_qualification(cleaned)
+    # Sentence-level action structure outranks nouns inside the action object. For example,
+    # “开展 Agent 能力评测” is work performed by the employee, not a candidate qualification.
+    return bool(_RESPONSIBILITY_START_RE.match(cleaned))
 
 
 def is_recruitment_intent_text(text: str) -> bool:
@@ -210,11 +232,10 @@ def _category_for(value: str, fallback: str = "unknown") -> str:
     cleaned = clean_text(value)
     if _BENEFIT_RE.search(cleaned):
         return "benefit"
-    # Qualification signals deliberately win over embedded words such as “开发” and “设计”.
-    if looks_like_qualification(cleaned):
-        return "requirement"
     if looks_like_responsibility(cleaned):
         return "responsibility"
+    if looks_like_qualification(cleaned):
+        return "requirement"
     if _is_skill_only(cleaned):
         return "skill"
     return fallback
@@ -264,6 +285,8 @@ def _concise_requirement(text: str) -> str:
     value = re.sub(r"Linux\s*后台系统?\s*相关研发(?:经历|经验)", "Linux 后台系统研发经验", value)
     value = re.sub(r"Linux\s*后台\s*相关研发(?:经历|经验)", "Linux 后台系统研发经验", value)
     value = value.replace("CS 基础", "计算机基础").replace("CS基础", "计算机基础")
+    value = re.sub(r"(团队(?:合作|协作)意识)能力", r"\1", value)
+    value = re.sub(r"(意识)能力$", r"\1", value)
     if re.fullmatch(r"扎实的?计算机基础", value):
         value = "具备扎实的计算机基础"
     if value.startswith("具有良好的") and any(term in value for term in ("知识", "意识", "能力")):
@@ -285,6 +308,52 @@ def _experience_months(text: str) -> int | None:
         return int(float(match.group(1)) * 12)
     match = re.search(r"(?:至少)?\s*(\d+)\s*个月(?:以上)?", text)
     return int(match.group(1)) if match else None
+
+
+_EDUCATION_LEVELS = (
+    (re.compile(r"博士"), 6),
+    (re.compile(r"硕士|硕士研究生|研究生"), 5),
+    (re.compile(r"本科|学士"), 4),
+    (re.compile(r"大专|专科"), 3),
+    (re.compile(r"高中|中专"), 2),
+    (re.compile(r"初中"), 1),
+)
+
+
+def _education_level(text: str) -> int | None:
+    if re.search(r"学历不限|不限学历", text):
+        return 0
+    for pattern, level in _EDUCATION_LEVELS:
+        if pattern.search(text):
+            return level
+    return None
+
+
+def _experience_range(text: str) -> tuple[int | None, int | None]:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|—|~|～|至|到)\s*(\d+(?:\.\d+)?)\s*年", text)
+    if match:
+        return int(float(match.group(1)) * 12), int(float(match.group(2)) * 12)
+    value = _experience_months(text)
+    return value, None
+
+
+def _semantic_roles(value: str, category: str) -> tuple[str, str | None, str | None]:
+    cleaned = clean_text(value)
+    if category == "responsibility":
+        match = re.match(
+            r"^(负责|参与|协助|支持|完成|开展|推动|推进|跟进|维护|搭建|交付|承担|制定|"
+            r"建设|实现|使用|基于|组织|主导|配合|研究|分析|构建|迭代|设计|开发|训练|评估|部署|优化)",
+            cleaned,
+        )
+        action = match.group(1) if match else None
+        action_object = cleaned[match.end():].strip() if match else cleaned
+        return "employee", action, action_object or None
+    if category in {"requirement", "skill"}:
+        match = re.match(r"^(具备|具有|熟悉|掌握|了解|能够|会用|懂|有)", cleaned)
+        return "candidate", match.group(1) if match else None, cleaned[match.end():].strip() if match else cleaned
+    if category == "benefit":
+        return "company", "提供", cleaned
+    return "unknown", None, cleaned or None
 
 
 def _deduplicate_values(values: Iterable[str]) -> list[str]:
@@ -322,6 +391,8 @@ def normalize_job_fields(fields: dict[str, Any]) -> dict[str, Any]:
     buckets: dict[str, list[str]] = {field: [] for field in _LIST_FIELDS}
     skills: list[str] = []
     detected_min = raw.get("experience_min_months")
+    detected_max = raw.get("experience_max_months")
+    detected_education = raw.get("education_min_level")
 
     for field in _LIST_FIELDS:
         fallback = _FIELD_CATEGORY[field]
@@ -331,9 +402,14 @@ def normalize_job_fields(fields: dict[str, Any]) -> dict[str, Any]:
             for atom in split_atomic_clauses(original):
                 if is_recruitment_intent_text(atom):
                     continue
-                months = _experience_months(atom) if fallback == "requirement" else None
-                if months is not None:
-                    detected_min = max(int(detected_min or 0), months)
+                minimum, maximum = _experience_range(atom) if fallback == "requirement" else (None, None)
+                if minimum is not None:
+                    detected_min = max(int(detected_min or 0), minimum)
+                if maximum is not None:
+                    detected_max = max(int(detected_max or 0), maximum)
+                education = _education_level(atom) if fallback == "requirement" else None
+                if education is not None:
+                    detected_education = max(int(detected_education or 0), education)
                 category = _category_for(atom, fallback)
                 if field == "skills_json" and not _is_skill_only(atom):
                     category = _category_for(atom, "requirement")
@@ -359,6 +435,14 @@ def normalize_job_fields(fields: dict[str, Any]) -> dict[str, Any]:
             raw[field] = normalized
     if detected_min is not None:
         raw["experience_min_months"] = int(detected_min)
+    if detected_max is not None:
+        raw["experience_max_months"] = int(detected_max)
+    if detected_education is not None:
+        raw["education_min_level"] = int(detected_education)
+    combined = " ".join(str(raw.get(key, "")) for key in ("title", "recruitment", "employment"))
+    if "实习" in combined or raw.get("recruitment") == "internship" or raw.get("employment") == "internship":
+        raw["recruitment"] = "internship"
+        raw["employment"] = "internship"
     return JobFields.model_validate(raw).model_dump(exclude_none=True)
 
 
@@ -417,10 +501,20 @@ def rewrite_jd_text(
     )
 
 
-def classify_atomic_text(text: str, *, source_type: str = "explicit") -> list[SemanticFact]:
+def classify_atomic_text(
+    text: str,
+    *,
+    source_type: str = "explicit",
+    source_section: str = "unknown",
+    source_item_index: int | None = None,
+) -> list[SemanticFact]:
     facts: list[SemanticFact] = []
+    section_fallback = {
+        "requirements": "requirement",
+        "qualifications": "requirement",
+    }.get(source_section, "unknown")
     for atom in split_atomic_clauses(text):
-        category = _category_for(atom)
+        category = _category_for(atom, section_fallback)
         importance = (
             "preferred" if category == "requirement" and "优先" in atom
             else "must" if category == "requirement"
@@ -428,9 +522,12 @@ def classify_atomic_text(text: str, *, source_type: str = "explicit") -> list[Se
             else "unknown"
         )
         value = _concise_requirement(atom) if category == "requirement" else _concise_responsibility(atom)
+        subject, action, action_object = _semantic_roles(value, category)
         facts.append(SemanticFact(
             value=value, category=category, importance=importance, source_type=source_type,
             evidence_text=atom, needs_confirmation=category == "unknown" or source_type == "inferred",
+            source_section=source_section, source_item_index=source_item_index,
+            subject=subject, action=action, action_object=action_object,
         ))
         if category in {"requirement", "responsibility"}:
             for skill in _extract_skills(atom):
@@ -438,8 +535,74 @@ def classify_atomic_text(text: str, *, source_type: str = "explicit") -> list[Se
                     value=skill, category="skill", importance=importance,
                     source_type=source_type, evidence_text=atom,
                     needs_confirmation=source_type == "inferred",
+                    source_section=source_section, source_item_index=source_item_index,
+                    subject="candidate" if category == "requirement" else "unknown",
                 ))
     return _deduplicate_facts(facts)
+
+
+def analyze_jd_text(
+    text: str,
+) -> JDAnalysis:
+    """Section-aware extraction with an explicit coverage decision for every source item."""
+    facts: list[SemanticFact] = []
+    coverage: list[CoverageItem] = []
+    scalar_fields: dict[str, Any] = {}
+    questions: list[str] = []
+    for item in parse_jd_sections(text):
+        item_facts = classify_atomic_text(
+            item.text,
+            source_section=item.section,
+            source_item_index=item.item_index,
+        )
+        facts.extend(item_facts)
+        categories = {fact.category for fact in item_facts if fact.category != "skill"}
+        targets: list[str] = []
+        status = "needs_clarification"
+        reason = "条目语义仍需确认，未静默丢弃"
+        if "responsibility" in categories:
+            status, reason = "projected_responsibility", "员工动作已投影为岗位职责"
+            targets.append("responsibilities_json")
+        elif "requirement" in categories:
+            status, reason = "projected_requirement", "候选人资格已投影为任职要求"
+            targets.append("requirements_json")
+        elif "benefit" in categories:
+            status, reason = "projected_benefit", "公司提供项已投影为福利"
+            targets.append("benefits_json")
+        elif item_facts and all(fact.category == "skill" for fact in item_facts):
+            status, reason = "projected_skill", "明确技术标签已投影为技能"
+            targets.append("skills_json")
+        else:
+            questions.append(f"请确认这条内容应归入岗位职责还是任职要求：“{item.text}”")
+
+        education = _education_level(item.text)
+        minimum, maximum = _experience_range(item.text)
+        if education is not None:
+            scalar_fields["education_min_level"] = max(
+                int(scalar_fields.get("education_min_level") or 0), education,
+            )
+            targets.append("education_min_level")
+        if minimum is not None:
+            scalar_fields["experience_min_months"] = max(
+                int(scalar_fields.get("experience_min_months") or 0), minimum,
+            )
+            targets.append("experience_min_months")
+        if maximum is not None:
+            scalar_fields["experience_max_months"] = max(
+                int(scalar_fields.get("experience_max_months") or 0), maximum,
+            )
+            targets.append("experience_max_months")
+        coverage.append(CoverageItem(
+            source_item=item, status=status, targets=list(dict.fromkeys(targets)), reason=reason,
+        ))
+    if re.search(r"实习(?:生|岗位|招聘)?", text):
+        scalar_fields.update({"recruitment": "internship", "employment": "internship"})
+    return JDAnalysis(
+        facts=_deduplicate_facts(facts),
+        coverage=coverage,
+        scalar_fields=JobFields.model_validate(scalar_fields),
+        clarification_questions=list(dict.fromkeys(questions)),
+    )
 
 
 def inferred_pretraining_suggestions(
@@ -501,6 +664,86 @@ def project_semantic_facts(facts: Iterable[SemanticFact]) -> dict[str, list[str]
     return {field: _deduplicate_values(values) for field, values in projected.items()}
 
 
+def apply_constrained_rewrites(
+    command: StructuredCommand,
+    batch: ConstrainedRewriteBatch,
+    original_text: str,
+) -> StructuredCommand:
+    """Accept only traceable, non-strengthening LLM edits; preserve every uncovered fact."""
+    facts = list(command.semantic_facts)
+    accepted: list[SemanticFact] = []
+    replaced: set[int] = set()
+    for proposal in batch.rewrites:
+        indices = list(dict.fromkeys(proposal.evidence_indices))
+        if not indices or any(index < 0 or index >= len(facts) for index in indices):
+            continue
+        sources = [facts[index] for index in indices]
+        if (
+            not proposal.preserves_strength
+            or any(fact.category != proposal.category for fact in sources)
+            or any(fact.source_type not in {"explicit", "user_confirmed"} for fact in sources)
+            or any(semantic_key(fact.evidence_text) not in semantic_key(original_text) for fact in sources)
+        ):
+            continue
+        evidence = " ".join(
+            text for fact in sources for text in (fact.evidence_texts or [fact.evidence_text])
+        )
+        rewritten = clean_text(proposal.rewritten_text)
+        introduced_strong = any(term in rewritten and term not in evidence for term in _STRONG_TERMS)
+        introduced_high_risk = bool(_HIGH_RISK_RE.search(rewritten) and not _HIGH_RISK_RE.search(evidence))
+        source_skills = set(_extract_skills(evidence))
+        proposed_skills = set(_extract_skills(rewritten))
+        source_technical_tokens = {
+            token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z0-9+_.-]{1,}", evidence)
+        }
+        proposed_technical_tokens = {
+            token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z0-9+_.-]{1,}", rewritten)
+        }
+        if (
+            introduced_strong
+            or introduced_high_risk
+            or not proposed_skills.issubset(source_skills)
+            or not proposed_technical_tokens.issubset(source_technical_tokens)
+        ):
+            continue
+        if proposal.category == "responsibility" and not looks_like_responsibility(rewritten):
+            continue
+        if proposal.category == "requirement" and looks_like_responsibility(rewritten):
+            continue
+        first = sources[0]
+        subject, action, action_object = _semantic_roles(rewritten, proposal.category)
+        accepted.append(first.model_copy(update={
+            "value": rewritten,
+            "evidence_text": first.evidence_text,
+            "evidence_texts": list(dict.fromkeys(
+                text for fact in sources for text in (fact.evidence_texts or [fact.evidence_text])
+            )),
+            "source_section": first.source_section if all(
+                fact.source_section == first.source_section for fact in sources
+            ) else "unknown",
+            "source_item_index": first.source_item_index,
+            "subject": subject,
+            "action": action,
+            "action_object": action_object,
+            "needs_confirmation": False,
+        }))
+        replaced.update(indices)
+    if not accepted:
+        return command
+    merged = _deduplicate_facts([
+        *(fact for index, fact in enumerate(facts) if index not in replaced),
+        *accepted,
+    ])
+    fields = command.fields.model_dump(exclude_none=True)
+    for field in _LIST_FIELDS:
+        fields.pop(field, None)
+    fields.update(project_semantic_facts(merged))
+    return command.model_copy(update={
+        "semantic_facts": merged,
+        "fields": JobFields.model_validate(normalize_job_fields(fields)),
+    })
+
+
 def semantic_review(fields: dict[str, Any], facts: Iterable[SemanticFact] = ()) -> list[SemanticIssue]:
     """Review classification before preview; only clear, unresolved conflicts are blocking."""
     issues: list[SemanticIssue] = []
@@ -558,6 +801,18 @@ def reconcile_command_semantics(command: StructuredCommand, original_text: str =
     }
     compact_original = semantic_key(original_text)
     facts: list[SemanticFact] = []
+    coverage = list(command.coverage)
+    coverage_questions: list[str] = []
+    if original_text and has_jd_structure(original_text):
+        analysis = analyze_jd_text(original_text)
+        facts.extend(analysis.facts)
+        coverage = analysis.coverage
+        coverage_questions = analysis.clarification_questions
+        for key, value in analysis.scalar_fields.model_dump(exclude_none=True).items():
+            if key in {"education_min_level", "experience_min_months", "experience_max_months"}:
+                raw_fields[key] = max(int(raw_fields.get(key) or 0), int(value))
+            else:
+                raw_fields[key] = value
 
     for fact in command.semantic_facts:
         if is_recruitment_intent_text(fact.value):
@@ -565,7 +820,12 @@ def reconcile_command_semantics(command: StructuredCommand, original_text: str =
         source = fact.source_type
         if original_text and source == "explicit" and semantic_key(fact.evidence_text) not in compact_original:
             source = "inferred"
-        for classified in classify_atomic_text(fact.value, source_type=source):
+        for classified in classify_atomic_text(
+            fact.value,
+            source_type=source,
+            source_section=fact.source_section,
+            source_item_index=fact.source_item_index,
+        ):
             if classified.category == "unknown" and fact.category != "unknown":
                 classified = classified.model_copy(update={
                     "category": fact.category,
@@ -643,6 +903,11 @@ def reconcile_command_semantics(command: StructuredCommand, original_text: str =
                 source_type=source.source_type if source else "explicit",
                 evidence_text=source.evidence_text if source else value,
                 needs_confirmation=False,
+                source_section=source.source_section if source else "unknown",
+                source_item_index=source.source_item_index if source else None,
+                subject=source.subject if source else "unknown",
+                action=source.action if source else None,
+                action_object=source.action_object if source else None,
             ))
     inferred, suggested_questions = inferred_pretraining_suggestions(
         normalized_facts, str(normalized_fields.get("title", "")),
@@ -655,11 +920,14 @@ def reconcile_command_semantics(command: StructuredCommand, original_text: str =
                 f"任职要求建议确认：{names} 是全部要求，还是熟悉其中一种即可？"
             )
     all_facts = _deduplicate_facts([*normalized_facts, *inferred])
-    questions = list(dict.fromkeys([*command.clarification_questions, *suggested_questions]))
+    questions = list(dict.fromkeys([
+        *command.clarification_questions, *coverage_questions, *suggested_questions,
+    ]))
     return command.model_copy(update={
         "fields": JobFields.model_validate(normalized_fields),
         "semantic_facts": all_facts,
         "clarification_questions": questions,
+        "coverage": coverage,
         "clear_fields": [field for field in command.clear_fields if field not in normalized_fields],
     })
 

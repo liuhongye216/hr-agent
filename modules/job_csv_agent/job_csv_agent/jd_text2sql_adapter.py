@@ -18,6 +18,8 @@ from jd_text2sql.llm import text2sql_with_llm  # noqa: E402
 from jd_text2sql.rule_text2sql import SQLDraft, generate_rule_sql  # noqa: E402
 from jd_text2sql.sql_guard import guard_sql  # noqa: E402
 
+from .schemas import QueryResult, QueryResultKind
+
 
 class JDText2SQLAdapter:
     """Makes CSV writes immediately visible to the existing guarded query module."""
@@ -41,7 +43,13 @@ class JDText2SQLAdapter:
         if not rule_draft.matched_rules:
             llm_draft = text2sql_with_llm(question)
             if llm_draft.needs_clarification:
-                return {"needs_clarification": True, "message": llm_draft.clarification_question}
+                result = QueryResult(
+                    kind=QueryResultKind.CLARIFICATION,
+                    message=llm_draft.clarification_question or "请补充查询条件。",
+                    generator="llm",
+                ).model_dump(mode="json")
+                result["needs_clarification"] = True
+                return result
             draft = SQLDraft(
                 sql=llm_draft.sql,
                 parameters=tuple(llm_draft.parameters()),
@@ -51,9 +59,26 @@ class JDText2SQLAdapter:
             generator = "llm"
         guarded = guard_sql(draft.sql, draft.parameters, INTERNAL_RELATIONS, max_rows=max_rows)
         rows = execute_readonly(self.db_path, guarded.sql, guarded.parameters)
-        return {
-            "needs_clarification": False,
-            "generator": generator,
-            "explanation": draft.explanation,
-            "rows": rows,
-        }
+        aggregate = bool(rows) and len(rows[0]) == 1 and any(
+            token in draft.sql.casefold() for token in ("count(", "sum(", "avg(", "min(", "max(")
+        )
+        if aggregate:
+            scalar_name, scalar_value = next(iter(rows[0].items()))
+            result = QueryResult(
+                kind=QueryResultKind.SCALAR,
+                rows=rows,
+                scalar_name=scalar_name,
+                scalar_value=scalar_value,
+                generator=generator,
+                explanation=draft.explanation,
+            )
+        else:
+            result = QueryResult(
+                kind=QueryResultKind.DETAIL if len(rows) == 1 else QueryResultKind.TABLE,
+                rows=rows,
+                generator=generator,
+                explanation=draft.explanation,
+            )
+        payload = result.model_dump(mode="json")
+        payload["needs_clarification"] = False
+        return payload

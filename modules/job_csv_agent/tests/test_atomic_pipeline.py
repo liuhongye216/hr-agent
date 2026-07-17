@@ -166,7 +166,7 @@ def test_suggestions_are_grouped_and_limited_to_three() -> None:
     assert sum(len(items) for items in grouped.values()) == 3
 
 
-def test_rejected_suggestion_is_not_repeated(tmp_path: Path) -> None:
+def test_forced_command_does_not_generate_semantic_suggestions(tmp_path: Path) -> None:
     repository = empty_repository(tmp_path / "jobs.csv")
     agent = JobCsvAgent(repository, NoCallInterpreter())
     state = agent.handle(initial_state(), "创建预训练岗位，职责是从0开始预训练大模型", {
@@ -176,8 +176,6 @@ def test_rejected_suggestion_is_not_repeated(tmp_path: Path) -> None:
             "responsibilities_json": ["从0开始预训练大模型"],
         },
     })
-    assert "建议补充" in state["message"]
-    state = agent.handle(state, "不需要")
     assert "建议补充" not in state["message"]
 
 
@@ -220,7 +218,7 @@ def test_preview_contains_strict_business_json(tmp_path: Path) -> None:
     state = create_preview(JobCsvAgent(empty_repository(tmp_path / "jobs.csv"), NoCallInterpreter()))
     preview = message_json(state["message"])
     assert preview["公司名称"] == "美团"
-    assert preview["任职要求"] == ["熟练掌握 Python 或 Java", "具备扎实的编程基础"]
+    assert preview["任职要求"] == ["熟练掌握Python或Java，具备扎实的编程基础"]
     assert "requirements_json" not in state["message"]
 
 
@@ -231,9 +229,9 @@ def test_editable_chinese_json_updates_draft_and_runs_pipeline(tmp_path: Path) -
     edited["任职要求"] = ["具有至少1年以上linux后台系统相关研发经历，扎实的CS基础。"]
     state = agent.handle(state, json.dumps(edited, ensure_ascii=False))
     assert state["phase"] == Phase.CONFIRMING.value
-    assert state["pending_fields"]["experience_min_months"] == 12
+    assert state["pending_fields"].get("experience_min_months") is None
     assert state["pending_fields"]["requirements_json"] == [
-        "具有 Linux 后台系统研发经验", "具备扎实的计算机基础",
+        "具有至少1年以上linux后台系统相关研发经历，扎实的CS基础",
     ]
 
 
@@ -302,20 +300,9 @@ def test_meituan_sample_end_to_end_json_edit_confirm_and_sqlite_sync(tmp_path: P
         },
     })
     preview = message_json(state["message"])
-    assert preview["最低经验月数"] == 12
-    assert preview["任职要求"] == [
-        "具有 Linux 后台系统研发经验", "具备扎实的计算机基础", "熟练掌握 Python 或 Java",
-        "具备扎实的编程基础", "熟悉服务架构设计与搭建", "掌握数据库使用及基本原理",
-        "熟悉 FastAPI 或 Django", "熟悉 MySQL", "熟悉消息队列（MQ）",
-        "具备良好的软件工程知识", "具备良好的编码规范意识", "重视代码与设计质量",
-        "熟悉 Spark、Flink、Doris 等大数据工具", "了解 SQL 解析原理及相关应用",
-        "具有大模型应用评测经验者优先", "具有大模型应用调优经验者优先",
-        "具备良好的沟通能力", "具备良好的团队协作能力", "学习能力强",
-    ]
-    assert set(preview["技能要求"]) == {
-        "SQL", "ETL", "Python", "Java", "LangGraph", "AutoGen", "CrewAI", "FastAPI",
-        "Django", "MySQL", "MQ", "Spark", "Flink", "Doris", "Linux",
-    }
+    assert preview["最低经验月数"] is None
+    assert preview["任职要求"] == [item.rstrip("。") for item in requirements]
+    assert preview["技能要求"] == []
     assert all("。、" not in item and not item.endswith("。") for item in preview["任职要求"])
 
     preview["工作城市"] = "北京"

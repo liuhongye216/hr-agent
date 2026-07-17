@@ -13,7 +13,42 @@ from job_csv_agent.semantics import reconcile_command_semantics, rewrite_jd_text
 
 class NoCallInterpreter:
     def extract(self, text: str, context: dict) -> StructuredCommand:
-        raise AssertionError(f"deterministic path unexpectedly called interpreter for: {text}")
+        commands = {
+            "我要招正式工": {
+                "intent": "create", "fields": {"employment": "full_time"},
+                "route": {"category": "job_write", "action": "create", "confidence": 0.99},
+            },
+            "后浪澎湃公司 保洁员": {
+                "intent": "update", "fields": {"company_name": "后浪澎湃公司", "title": "保洁员"},
+                "route": {"category": "job_write", "action": "update", "confidence": 0.99},
+            },
+            "我要招大模型后训练实习生": {
+                "intent": "create",
+                "fields": {"title": "大模型后训练实习生", "employment": "internship", "recruitment": "internship"},
+                "clarification_questions": ["后训练范围是 SFT、RLHF/DPO、奖励模型、模型评估，还是其他任务？"],
+                "route": {"category": "job_write", "action": "create", "confidence": 0.99},
+            },
+            "后浪澎湃科技有限公司，后训练是训练一个招聘模型，技能主要是懂llm": {
+                "intent": "update",
+                "fields": {
+                    "company_name": "后浪澎湃科技有限公司",
+                    "responsibilities_json": ["负责招聘领域大模型的后训练工作"],
+                    "requirements_json": ["具备大语言模型（LLM）相关基础知识"],
+                },
+                "semantic_facts": [
+                    {"value": "负责招聘领域大模型的后训练工作", "category": "responsibility", "importance": "neutral", "source_type": "explicit", "evidence_text": "后训练是训练一个招聘模型"},
+                    {"value": "具备大语言模型（LLM）相关基础知识", "category": "requirement", "importance": "must", "source_type": "explicit", "evidence_text": "懂llm"},
+                ],
+                "route": {"category": "job_write", "action": "update", "confidence": 0.99},
+            },
+            "修改后浪澎湃公司的保洁员岗位": {
+                "intent": "update", "search_query": "后浪澎湃公司 保洁员",
+                "route": {"category": "job_write", "action": "update", "confidence": 0.99},
+            },
+        }
+        if text not in commands:
+            raise AssertionError(f"missing model stub for: {text}")
+        return StructuredCommand.model_validate(commands[text])
 
 
 def empty_repository(path: Path) -> CsvJobRepository:
@@ -31,21 +66,11 @@ def assert_no_internal_terms(message: str) -> None:
     assert not [term for term in forbidden if term in lowered]
 
 
-def test_deterministic_intent_routing_and_employment() -> None:
-    create = deterministic_command("我要招正式工")
-    assert create is not None
-    assert create.intent == "create"
-    assert create.fields.employment == "full_time"
-
-    intern = deterministic_command("我要招一个实习生")
-    assert intern is not None
-    assert intern.intent == "create"
-    assert intern.fields.employment == "internship"
-    assert intern.fields.recruitment == "internship"
-
-    assert deterministic_command("修改后浪澎湃公司的保洁员岗位").intent == "update"
-    assert deterministic_command("查询后浪澎湃公司的保洁员岗位").intent == "search"
-    assert deterministic_command("删除后浪澎湃公司的保洁员岗位").intent == "delete"
+def test_deterministic_business_language_routing_is_disabled() -> None:
+    assert deterministic_command("我要招正式工") is None
+    assert deterministic_command("修改后浪澎湃公司的保洁员岗位") is None
+    assert deterministic_command("查询后浪澎湃公司的保洁员岗位") is None
+    assert deterministic_command("删除后浪澎湃公司的保洁员岗位") is None
 
 
 def test_creating_state_inherits_company_and_title_without_search(tmp_path: Path) -> None:

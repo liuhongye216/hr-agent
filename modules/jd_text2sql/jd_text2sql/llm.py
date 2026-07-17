@@ -15,6 +15,14 @@ class SemanticEvidenceFact(BaseModel):
     source_type: Literal["explicit", "inferred", "user_confirmed"]
     evidence_text: str
     needs_confirmation: bool = False
+    source_section: Literal[
+        "job_description", "responsibilities", "work_content", "requirements",
+        "qualifications", "benefits", "unknown",
+    ] = "unknown"
+    source_item_index: int | None = None
+    subject: Literal["employee", "candidate", "company", "unknown"] = "unknown"
+    action: str | None = None
+    action_object: str | None = None
 
 
 class LLMLongTextExtraction(BaseModel):
@@ -107,6 +115,8 @@ LONG_TEXT_SYSTEM = """你是招聘 JD 长文本语义事实抽取器。标量字
 - unknown：证据不足或存在歧义，必须 needs_confirmation=true，不能强行归类。
 
 每条事实输出 value、category、importance(must/preferred/neutral/unknown)、source_type(explicit/inferred/user_confirmed)、evidence_text、needs_confirmation。evidence_text 必须是 jd_raw 中连续且逐字一致的原文。只有 explicit 且分类明确或 user_confirmed 的事实可进入业务字段；inferred 只能作为待确认建议，unknown 必须追问。禁止把常识推断包装成原文明示内容。
+
+先识别职位描述、岗位职责、工作内容、职位要求、任职要求、任职资格和福利待遇章节，并输出 source_section、source_item_index、subject、action、action_object。章节是重要上下文，但句子真实语义优先：候选人“具备风险分析能力”是 requirement；“推进风险决策能力的建模和优化”是 responsibility；“开展 Agent 能力评测”中的能力是动作对象，不是候选人资格。“参与训练环境的设计、搭建与迭代”必须保持为一个完整动作，不能产生孤立的“搭建与迭代”。
 
 示例：
 - “从0开始预训练大模型”是 responsibility，不是 requirement。

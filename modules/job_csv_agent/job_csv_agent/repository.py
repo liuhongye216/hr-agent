@@ -18,7 +18,7 @@ from .schemas import (
     BUSINESS_COLUMNS, CREATE_CONTENT_FIELDS, EDITABLE_FIELDS, JSON_FIELDS, JobFields,
     REQUIRED_CREATE_FIELDS, SemanticFact,
 )
-from .semantics import SEMANTIC_FIELD_BY_CATEGORY, semantic_key
+from .guards import SEMANTIC_FIELD_BY_CATEGORY, text_key
 
 
 class JobNotFoundError(LookupError):
@@ -125,7 +125,7 @@ class CsvJobRepository:
         for fact in parsed_facts:
             containing_fields = [
                 field for field, values in formal_values.items()
-                if semantic_key(fact.value) in {semantic_key(value) for value in values}
+                if text_key(fact.value) in {text_key(value) for value in values}
             ]
             if not containing_fields:
                 continue

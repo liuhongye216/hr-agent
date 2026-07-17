@@ -25,6 +25,18 @@ def test_city_and_education_count(db_path: Path) -> None:
     assert rows == [{"job_count": 1}]
 
 
+@pytest.mark.parametrize("question", [
+    "统计有多少条目", "一共有几个岗位", "目前岗位数量是多少", "帮我数一下岗位",
+    "现在收录了多少条招聘信息",
+])
+def test_bare_count_is_a_matched_rule(question: str, db_path: Path) -> None:
+    draft = generate_rule_sql(question, db_path)
+    assert "aggregate:count" in draft.matched_rules
+    assert "COUNT(*) AS job_count" in draft.sql
+    rows = execute_readonly(db_path, draft.sql, draft.parameters)
+    assert rows == [{"job_count": 100}]
+
+
 def test_salary_query_forces_currency_and_period(db_path: Path) -> None:
     draft = generate_rule_sql("月薪下限10k以上的岗位", db_path)
     assert "salary_currency = 'CNY'" in draft.sql

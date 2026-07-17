@@ -51,7 +51,7 @@ def test_fastapi_session_confirmation_flow(tmp_path: Path) -> None:
         assert len(CsvJobRepository(csv_path).search("API 示例公司")) == 1
 
 
-def test_placeholder_api_key_returns_actionable_422(tmp_path: Path, monkeypatch) -> None:
+def test_placeholder_api_key_degrades_without_mutating_state(tmp_path: Path, monkeypatch) -> None:
     csv_path = tmp_path / "jobs.csv"
     with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
         csv.DictWriter(handle, fieldnames=BUSINESS_COLUMNS).writeheader()
@@ -64,8 +64,10 @@ def test_placeholder_api_key_returns_actionable_422(tmp_path: Path, monkeypatch)
             f"/sessions/{session_id}/messages", json={"content": "帮我处理一个岗位"},
         )
 
-    assert response.status_code == 422
-    assert "示例占位值" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["phase"] == "IDLE"
+    assert "草稿已保留" in response.json()["message"]
+    assert CsvJobRepository(csv_path).search("岗位") == []
 
 
 def test_second_confirmation_is_not_rejected_by_fuzzy_semantics(tmp_path: Path) -> None:
