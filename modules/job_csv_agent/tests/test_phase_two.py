@@ -91,11 +91,11 @@ def test_safe_rewrite_and_confidence_hard_rules() -> None:
         evidence_text="后训练是训练一个招聘模型",
     )
     assert duty.decision == "safe_rewrite"
-    assert duty.rewritten_text == "负责招聘领域大模型的后训练工作。"
+    assert duty.rewritten_text == "负责招聘领域大模型的后训练工作"
 
     requirement = rewrite_jd_text("懂llm", "requirement", evidence_text="懂llm")
     assert requirement.decision == "safe_rewrite"
-    assert requirement.rewritten_text == "具备大语言模型（LLM）相关基础知识。"
+    assert requirement.rewritten_text == "具备大语言模型（LLM）相关基础知识"
     assert "精通" not in requirement.rewritten_text
 
     suggestion = rewrite_jd_text(
@@ -121,7 +121,7 @@ def test_large_model_end_to_end_preview_and_question_dedup(tmp_path: Path) -> No
     assert first["message"].count("？") <= 3
     assert_no_internal_terms(first["message"])
 
-    scope_question = "请确认后训练范围：SFT、RLHF/DPO、奖励模型、模型评估，还是其他任务？"
+    scope_question = "后训练范围是 SFT、RLHF/DPO、奖励模型、模型评估，还是其他任务？"
     assert scope_question in first["message"]
 
     second = agent.handle(
@@ -132,8 +132,8 @@ def test_large_model_end_to_end_preview_and_question_dedup(tmp_path: Path) -> No
     pending = second["pending_fields"]
     assert pending["company_name"] == "后浪澎湃科技有限公司"
     assert pending["title"] == "大模型后训练实习生"
-    assert pending["responsibilities_json"] == ["负责招聘领域大模型的后训练工作。"]
-    assert pending["requirements_json"] == ["具备大语言模型（LLM）相关基础知识。"]
+    assert pending["responsibilities_json"] == ["负责招聘领域大模型的后训练工作"]
+    assert pending["requirements_json"] == ["具备大语言模型（LLM）相关基础知识"]
     assert scope_question not in second["message"]
     assert second["message"].count("？") <= 3
     assert_no_internal_terms(second["message"])
@@ -171,7 +171,7 @@ def test_user_confirmed_suggestion_can_enter_draft() -> None:
         }],
     })
     cleaned = reconcile_command_semantics(command, "确认需要做模型评估")
-    assert cleaned.fields.responsibilities_json == ["负责模型效果评估与结果分析。"]
+    assert cleaned.fields.responsibilities_json == ["负责模型效果评估与结果分析"]
 
 
 def test_explicit_update_not_found_message_is_natural(tmp_path: Path) -> None:

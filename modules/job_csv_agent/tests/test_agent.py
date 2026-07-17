@@ -130,8 +130,8 @@ def test_create_with_responsibility_only_and_inferred_suggestions(tmp_path: Path
     state = agent.handle(initial_state(), "请创建示例科技的大模型工程师，职责是从0开始预训练大模型")
     assert state["phase"] == Phase.CONFIRMING.value
     assert state["pending_fields"].get("requirements_json") is None
-    assert state["pending_fields"]["responsibilities_json"] == ["从0开始预训练大模型。"]
-    assert "确认前不会保存" in state["message"]
+    assert state["pending_fields"]["responsibilities_json"] == ["从0开始预训练大模型"]
+    assert "确认前不会写入岗位草稿" in state["message"]
     assert "从零训练基础模型" in state["message"]
     assert row_count(path) == 0
 
@@ -141,5 +141,5 @@ def test_create_with_responsibility_only_and_inferred_suggestions(tmp_path: Path
     assert state["phase"] == Phase.IDLE.value
     row = repository.search("示例科技 大模型工程师")[0]
     assert row["requirements_json"] == "[]"
-    assert row["responsibilities_json"] == '["从0开始预训练大模型。"]'
+    assert row["responsibilities_json"] == '["从0开始预训练大模型"]'
     assert row["skills_json"] == "[]"

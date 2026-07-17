@@ -59,20 +59,30 @@ def test_repository_allows_responsibility_only_create(tmp_path: Path) -> None:
     assert row["responsibilities_json"] == '["从0开始预训练大模型"]'
 
 
-def test_repository_rejects_semantic_misclassification(tmp_path: Path) -> None:
+def test_repository_does_not_repeat_fuzzy_semantic_classification(tmp_path: Path) -> None:
     path = tmp_path / "jobs.csv"
     empty_csv(path)
     repository = CsvJobRepository(path)
-    with pytest.raises(SemanticValidationError, match="动作型职责"):
+    row = repository.create({
+        "company_name": "示例科技", "title": "软件工程师",
+        "requirements_json": ["具有较好的软件工程知识和编码规范意识，对代码和设计质量有严格要求"],
+    })
+    assert row["job_id"]
+
+
+def test_repository_blocks_explicit_fact_field_conflict(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.csv"
+    empty_csv(path)
+    repository = CsvJobRepository(path)
+    fact = [{
+        "value": "负责系统开发", "category": "responsibility", "importance": "neutral",
+        "source_type": "explicit", "evidence_text": "负责系统开发",
+    }]
+    with pytest.raises(SemanticValidationError, match="不能写入"):
         repository.create({
-            "company_name": "示例科技", "title": "大模型工程师",
-            "requirements_json": ["从0开始预训练大模型"],
-        })
-    with pytest.raises(SemanticValidationError, match="候选人资格"):
-        repository.create({
-            "company_name": "示例科技", "title": "大模型工程师",
-            "responsibilities_json": ["本科及以上学历"],
-        })
+            "company_name": "示例科技", "title": "工程师",
+            "requirements_json": ["负责系统开发"],
+        }, fact)
 
 
 def test_inferred_fact_requires_user_confirmation_before_write(tmp_path: Path) -> None:

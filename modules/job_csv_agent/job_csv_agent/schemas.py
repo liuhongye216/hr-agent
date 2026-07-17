@@ -153,6 +153,18 @@ class RewriteResult(BaseModel):
     def clean_rewrite_text(cls, value: str) -> str:
         return " ".join(value.split())
 
+
+class SemanticIssue(BaseModel):
+    """User-facing semantic review result produced before persistence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: Literal["pass", "warning", "blocking"]
+    field: str | None = None
+    value: str | None = None
+    message: str
+
+
 class StructuredCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

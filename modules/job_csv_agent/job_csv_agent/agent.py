@@ -13,7 +13,9 @@ from .schemas import (
     SemanticFact, StructuredCommand,
 )
 from .repository import CsvJobRepository
-from .semantics import persisted_semantic_facts, reconcile_command_semantics
+from .semantics import (
+    normalize_job_fields, reconcile_command_semantics, semantic_key, semantic_review,
+)
 
 
 class Interpreter(Protocol):
@@ -29,7 +31,8 @@ class AgentState(TypedDict, total=False):
     clarification_questions: list[str]
     unanswered_questions: list[str]
     asked_questions: list[str]
-    pending_suggestions: list[str]
+    pending_suggestions: dict[str, list[str]]
+    dismissed_suggestions: list[str]
     missing_important_fields: list[str]
     incomplete_warning_acknowledged: bool
     target_id: str | None
@@ -52,7 +55,8 @@ def initial_state() -> AgentState:
         "clarification_questions": [],
         "unanswered_questions": [],
         "asked_questions": [],
-        "pending_suggestions": [],
+        "pending_suggestions": {},
+        "dismissed_suggestions": [],
         "missing_important_fields": [],
         "incomplete_warning_acknowledged": False,
         "target_id": None,
@@ -108,6 +112,151 @@ def _field_lines(fields: dict[str, Any]) -> str:
     )
 
 
+_ENUM_TO_CN = {
+    "internship": "实习", "campus": "校园招聘", "experienced": "社会招聘",
+    "mixed": "不限", "unknown": "未知", "full_time": "全职", "part_time": "兼职",
+    "full_or_part_time": "全职或兼职", "contract": "合同制", "temporary": "临时用工",
+    "onsite": "现场办公", "remote": "远程办公", "hybrid": "混合办公",
+}
+_CN_TO_ENUM = {
+    "recruitment": {"实习": "internship", "校园招聘": "campus", "社会招聘": "experienced", "不限": "mixed", "未知": "unknown"},
+    "employment": {"实习": "internship", "全职": "full_time", "兼职": "part_time", "全职或兼职": "full_or_part_time", "合同制": "contract", "临时用工": "temporary", "未知": "unknown"},
+    "work_mode": {"现场办公": "onsite", "远程办公": "remote", "混合办公": "hybrid", "未知": "unknown"},
+}
+_EDUCATION_TO_CN = {0: "不限", 1: "初中", 2: "高中/中专", 3: "大专", 4: "本科", 5: "硕士", 6: "博士"}
+_CN_TO_EDUCATION = {value: key for key, value in _EDUCATION_TO_CN.items()}
+_BUSINESS_JSON_KEYS = {
+    "公司名称", "岗位名称", "招聘类型", "用工类型", "最低经验月数", "任职要求", "岗位职责",
+    "技能要求", "工作城市", "办公模式", "学历要求", "薪资范围", "实习要求",
+}
+
+
+def _as_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    return [str(item) for item in value or []]
+
+
+def _business_preview(draft: dict[str, Any]) -> dict[str, Any]:
+    salary = None
+    if draft.get("salary_min") is not None or draft.get("salary_max") is not None:
+        salary = {
+            "最低": draft.get("salary_min"),
+            "最高": draft.get("salary_max"),
+            "币种": draft.get("salary_currency") or "CNY",
+            "周期": draft.get("salary_period") or "month",
+        }
+    education = draft.get("education_min_level")
+    return {
+        "公司名称": draft.get("company_name"),
+        "岗位名称": draft.get("title"),
+        "招聘类型": _ENUM_TO_CN.get(draft.get("recruitment"), draft.get("recruitment")),
+        "用工类型": _ENUM_TO_CN.get(draft.get("employment"), draft.get("employment")),
+        "最低经验月数": draft.get("experience_min_months"),
+        "任职要求": _as_list(draft.get("requirements_json")),
+        "岗位职责": _as_list(draft.get("responsibilities_json")),
+        "技能要求": _as_list(draft.get("skills_json")),
+        "工作城市": draft.get("city"),
+        "办公模式": _ENUM_TO_CN.get(draft.get("work_mode"), draft.get("work_mode")),
+        "学历要求": _EDUCATION_TO_CN.get(int(education), education) if education is not None else None,
+        "薪资范围": salary,
+        "实习要求": None,
+    }
+
+
+def _preview_json(draft: dict[str, Any]) -> str:
+    return json.dumps(_business_preview(draft), ensure_ascii=False, indent=2)
+
+
+def _row_draft(row: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in row.items():
+        if key not in JobFields.model_fields or value in (None, ""):
+            continue
+        if key in JSON_FIELDS:
+            try:
+                value = json.loads(value) if isinstance(value, str) else value
+            except json.JSONDecodeError:
+                value = []
+        result[key] = value
+    return JobFields.model_validate(result).model_dump(exclude_none=True)
+
+
+def _draft_json_command(text: str, phase: str) -> StructuredCommand:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("顶层必须是 JSON 对象")
+    unknown = sorted(set(payload) - _BUSINESS_JSON_KEYS)
+    if unknown:
+        raise ValueError(f"不支持的中文字段：{'、'.join(unknown)}")
+
+    fields: dict[str, Any] = {}
+    clears: list[str] = []
+    simple = {
+        "公司名称": "company_name", "岗位名称": "title", "最低经验月数": "experience_min_months",
+        "任职要求": "requirements_json", "岗位职责": "responsibilities_json", "技能要求": "skills_json",
+        "工作城市": "city",
+    }
+    for label, field in simple.items():
+        if label not in payload:
+            continue
+        value = payload[label]
+        if value is None:
+            clears.append(field)
+        else:
+            if field in JSON_FIELDS and not isinstance(value, list):
+                raise ValueError(f"{label}必须是 JSON 数组，清空请使用 []")
+            fields[field] = value
+    for label, field in (("招聘类型", "recruitment"), ("用工类型", "employment"), ("办公模式", "work_mode")):
+        if label not in payload:
+            continue
+        value = payload[label]
+        if value is None:
+            clears.append(field)
+        elif value in _CN_TO_ENUM[field]:
+            fields[field] = _CN_TO_ENUM[field][value]
+        elif value in _CN_TO_ENUM[field].values():
+            fields[field] = value
+        else:
+            raise ValueError(f"{label}的值不受支持：{value}")
+    if "学历要求" in payload:
+        value = payload["学历要求"]
+        if value is None:
+            clears.append("education_min_level")
+        elif isinstance(value, int) and 0 <= value <= 6:
+            fields["education_min_level"] = value
+        elif value in _CN_TO_EDUCATION:
+            fields["education_min_level"] = _CN_TO_EDUCATION[value]
+        else:
+            raise ValueError("学历要求应为不限、初中、高中/中专、大专、本科、硕士或博士")
+    if "薪资范围" in payload:
+        value = payload["薪资范围"]
+        salary_fields = ("salary_min", "salary_max", "salary_currency", "salary_period")
+        if value is None:
+            clears.extend(salary_fields)
+        elif isinstance(value, dict):
+            salary_map = {"最低": "salary_min", "最高": "salary_max", "币种": "salary_currency", "周期": "salary_period"}
+            if set(value) - set(salary_map):
+                raise ValueError("薪资范围只支持最低、最高、币种、周期")
+            for key, field in salary_map.items():
+                if key in value and value[key] is not None:
+                    fields[field] = value[key]
+        else:
+            raise ValueError("薪资范围应为 null 或包含最低、最高、币种、周期的 JSON 对象")
+    if payload.get("实习要求") not in (None, ""):
+        raise ValueError("当前 jobs.csv 没有独立实习要求字段，请将其作为任职要求中的原子条件填写")
+    intent = "create" if phase == Phase.IDLE.value else "update"
+    return StructuredCommand(
+        intent=intent, fields=JobFields.model_validate(fields), clear_fields=list(dict.fromkeys(clears)),
+    )
+
+
 def _merge_facts(
     existing: list[dict[str, Any]], incoming: list[SemanticFact],
 ) -> list[dict[str, Any]]:
@@ -125,17 +274,73 @@ def _merge_facts(
     return result
 
 
-def _semantic_notes(facts: list[dict[str, Any]], questions: list[str]) -> str:
+def _grouped_suggestions(
+    draft: dict[str, Any], facts: list[dict[str, Any]], questions: list[str],
+    dismissed: list[str] | None = None,
+) -> dict[str, list[str]]:
+    dismissed_keys = {semantic_key(item) for item in dismissed or []}
+    existing_values = [
+        str(value)
+        for field in ("requirements_json", "responsibilities_json", "skills_json", "benefits_json")
+        for value in _as_list(draft.get(field))
+    ]
+    existing_keys = {semantic_key(item) for item in existing_values}
+    existing_skills = {semantic_key(item) for item in _as_list(draft.get("skills_json"))}
+    groups = {"岗位职责": [], "任职要求": [], "技能要求": [], "工作信息": []}
+
+    def add(group: str, question: str) -> None:
+        question = re.sub(r"^(?:岗位职责|任职要求|技能要求|工作信息)建议确认：", "", question).strip()
+        key = semantic_key(question)
+        if not question or key in dismissed_keys:
+            return
+        if question not in groups[group] and sum(len(items) for items in groups.values()) < 3:
+            groups[group].append(question)
+
+    for question in questions:
+        if question.startswith("岗位职责"):
+            group = "岗位职责"
+        elif question.startswith("任职要求"):
+            group = "任职要求"
+        elif question.startswith("技能要求") or re.search(r"Python|PyTorch|技能", question, re.IGNORECASE):
+            group = "技能要求"
+        elif re.search(r"城市|办公|薪资|工作地点", question):
+            group = "工作信息"
+        else:
+            group = "任职要求"
+        add(group, question)
+
+    for fact in facts:
+        if fact.get("source_type") != "inferred":
+            continue
+        value = str(fact.get("value", ""))
+        key = semantic_key(value)
+        if key in existing_keys or key in dismissed_keys:
+            continue
+        if fact.get("category") == "skill" and key in existing_skills:
+            continue
+        group = {
+            "responsibility": "岗位职责", "requirement": "任职要求",
+            "skill": "技能要求", "unknown": "任职要求",
+        }.get(str(fact.get("category")), "任职要求")
+        add(group, f"是否补充“{value}”？")
+    return {group: items for group, items in groups.items() if items}
+
+
+def _semantic_notes(
+    draft: dict[str, Any], facts: list[dict[str, Any]], questions: list[str],
+    dismissed: list[str] | None = None,
+) -> tuple[str, dict[str, list[str]]]:
     unknown = [item["value"] for item in facts if item.get("category") == "unknown"]
-    inferred = [item["value"] for item in facts if item.get("source_type") == "inferred"]
+    grouped = _grouped_suggestions(draft, facts, questions, dismissed)
     sections: list[str] = []
     if unknown:
         sections.append("仍需您确认：" + "、".join(unknown))
-    if inferred:
-        sections.append("建议补充（确认前不会保存）：\n" + "\n".join(f"- {item}" for item in inferred))
-    if questions:
-        sections.append("接下来可优先确认：\n" + "\n".join(f"- {item}" for item in questions[:3]))
-    return "\n\n" + "\n\n".join(sections) if sections else ""
+    if grouped:
+        lines = ["建议补充（确认前不会写入岗位草稿）："]
+        for group, items in grouped.items():
+            lines.extend(["", f"{group}：", *(f"- {item}" for item in items)])
+        sections.append("\n".join(lines))
+    return ("\n\n" + "\n\n".join(sections) if sections else "", grouped)
 
 
 def _important_missing(draft: dict[str, Any]) -> list[str]:
@@ -226,7 +431,36 @@ class JobCsvAgent:
         self, state: AgentState | None, text: str, forced_command: dict[str, Any] | None = None,
     ) -> AgentState:
         current = {**initial_state(), **(state or {})}
-        current.update({"user_input": text.strip(), "forced_command": forced_command})
+        stripped = text.strip()
+        if (
+            forced_command is None
+            and re.fullmatch(r"(?:不需要|不用|不补充|否|拒绝|跳过)[。！!]?", stripped)
+            and current.get("pending_suggestions")
+        ):
+            dismissed = list(current.get("dismissed_suggestions", []))
+            dismissed.extend(
+                item for items in current.get("pending_suggestions", {}).values() for item in items
+            )
+            dismissed.extend(
+                str(item.get("value", "")) for item in current.get("semantic_facts", [])
+                if item.get("source_type") == "inferred"
+            )
+            current["dismissed_suggestions"] = list(dict.fromkeys(dismissed))
+            if current.get("pending_action") == "create" or current.get("phase") == Phase.CREATING.value:
+                draft = current.get("pending_fields", {}) or current.get("draft", {})
+                return self._creation_result(
+                    draft, {}, current.get("semantic_facts", []),
+                    current.get("clarification_questions", []), current, stripped,
+                )
+        if forced_command is None and stripped.startswith("{"):
+            try:
+                forced_command = _draft_json_command(stripped, current.get("phase", Phase.IDLE.value)).model_dump(mode="json")
+            except ValueError as exc:
+                return {
+                    **current, **_clean_turn(),
+                    "message": f"JSON 格式错误：{exc}。原岗位草稿已保留，请修正后重新发送。",
+                }
+        current.update({"user_input": stripped, "forced_command": forced_command})
         return self.graph.invoke(current)
 
     def _command(self, state: AgentState) -> StructuredCommand:
@@ -277,6 +511,7 @@ class JobCsvAgent:
         user_input: str = "",
     ) -> AgentState:
         previous_state = previous_state or initial_state()
+        draft = normalize_job_fields(draft)
         missing = self._missing(draft)
         important_missing = _important_missing(draft)
         all_questions = _priority_questions(draft, clarification_questions)
@@ -289,16 +524,28 @@ class JobCsvAgent:
         asked = list(previous_state.get("asked_questions", []))
         display_questions = [question for question in unresolved if question not in asked][:3]
         asked = list(dict.fromkeys([*asked, *display_questions]))
-        suggestions = [
-            item["value"] for item in semantic_facts if item.get("source_type") == "inferred"
-        ]
         recognized = f"本轮整理出的岗位信息：\n{_field_lines(changed)}"
-        notes = _semantic_notes(semantic_facts, display_questions)
+        notes, grouped_suggestions = _semantic_notes(
+            draft, semantic_facts,
+            [question for question in display_questions if question in clarification_questions],
+            previous_state.get("dismissed_suggestions", []),
+        )
+        review = semantic_review(
+            draft, [SemanticFact.model_validate(item) for item in semantic_facts],
+        )
+        warnings = [item.message for item in review if item.level == "warning"]
+        blocking = [item.message for item in review if item.level == "blocking"]
+        review_section = ""
+        if warnings or blocking:
+            review_section = "\n\n语义检查：\n" + "\n".join(
+                f"- {item}" for item in [*blocking, *warnings]
+            )
         question_state = {
             "clarification_questions": clarification_questions,
             "unanswered_questions": unresolved,
             "asked_questions": asked,
-            "pending_suggestions": suggestions,
+            "pending_suggestions": grouped_suggestions,
+            "dismissed_suggestions": previous_state.get("dismissed_suggestions", []),
             "missing_important_fields": important_missing,
             "incomplete_warning_acknowledged": False,
         }
@@ -309,7 +556,7 @@ class JobCsvAgent:
                 "semantic_facts": semantic_facts,
                 **question_state,
                 "missing_fields": missing, "can_confirm": False, "can_cancel": True,
-                "message": f"{recognized}{notes}\n\n要生成岗位，当前还需要：{labels}。",
+                "message": f"{recognized}{notes}{review_section}\n\n要生成岗位，当前还需要：{labels}。",
             }
         missing_section = (
             "\n\n仍未填写的重要信息：\n"
@@ -325,8 +572,10 @@ class JobCsvAgent:
             "pending_semantic_facts": semantic_facts,
             "missing_fields": [], "can_confirm": True, "can_cancel": True,
             "message": (
-                f"{recognized}\n\n已整理的岗位信息：\n{_field_lines(draft)}"
-                f"{notes}{missing_section}"
+                "已整理的岗位信息：\n```json\n"
+                f"{_preview_json(draft)}\n```\n\n"
+                "如果需要修改，可以复制上方 JSON，编辑后直接发送给我。"
+                f"{notes}{review_section}{missing_section}"
             ),
         }
 
@@ -461,14 +710,34 @@ class JobCsvAgent:
             )
         for field in clear_fields:
             lines.append(f"- {FIELD_LABELS.get(field, field)}：{_display_value(field, row.get(field))} ➔ （清空）")
+        candidate = _row_draft(row)
+        candidate.update(fields)
+        for field in clear_fields:
+            candidate.pop(field, None)
+        candidate = normalize_job_fields(candidate)
+        review = semantic_review(
+            candidate,
+            [SemanticFact.model_validate(item) for item in semantic_facts or []],
+        )
+        blocking = [item.message for item in review if item.level == "blocking"]
+        warnings = [item.message for item in review if item.level == "warning"]
+        review_section = ""
+        if blocking or warnings:
+            review_section = "\n\n语义检查：\n" + "\n".join(
+                f"- {item}" for item in [*blocking, *warnings]
+            )
         return {
             **_clean_turn(), "phase": Phase.CONFIRMING.value, "target_id": row["job_id"],
             "candidates": [], "pending_action": "update", "pending_fields": fields,
-            "pending_clear_fields": clear_fields, "can_confirm": True, "can_cancel": True,
+            "pending_clear_fields": clear_fields, "can_confirm": not blocking, "can_cancel": True,
             "pending_semantic_facts": semantic_facts or [],
             "message": (
                 f"请确认修改：{row['company_name']} - {row['title']}\n"
                 + "\n".join(lines)
+                + "\n\n修改后的岗位信息：\n```json\n"
+                + _preview_json(candidate)
+                + "\n```\n\n如果需要修改，可以复制上方 JSON，编辑后直接发送给我。"
+                + review_section
             ),
         }
 
@@ -534,14 +803,14 @@ class JobCsvAgent:
             if action == "create":
                 row = self.repository.create(
                     state.get("pending_fields", {}),
-                    persisted_semantic_facts(state.get("pending_semantic_facts", [])),
+                    state.get("pending_semantic_facts", []),
                 )
                 message = f"已保存新岗位：{row['company_name']} - {row['title']}。"
             elif action == "update":
                 _, row = self.repository.update(
                     state.get("target_id") or "", state.get("pending_fields", {}),
                     state.get("pending_clear_fields", []),
-                    persisted_semantic_facts(state.get("pending_semantic_facts", [])),
+                    state.get("pending_semantic_facts", []),
                 )
                 message = f"已更新岗位：{row['company_name']} - {row['title']}。"
             elif action == "delete":

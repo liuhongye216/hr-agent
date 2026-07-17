@@ -18,7 +18,7 @@ from .schemas import (
     BUSINESS_COLUMNS, CREATE_CONTENT_FIELDS, EDITABLE_FIELDS, JSON_FIELDS, JobFields,
     REQUIRED_CREATE_FIELDS, SemanticFact,
 )
-from .semantics import SEMANTIC_FIELD_BY_CATEGORY, classify_atomic_text
+from .semantics import SEMANTIC_FIELD_BY_CATEGORY, semantic_key
 
 
 class JobNotFoundError(LookupError):
@@ -114,8 +114,6 @@ class CsvJobRepository:
         fields: dict[str, Any],
         semantic_facts: list[dict[str, Any] | SemanticFact] | None = None,
     ) -> None:
-        requirements = cls._list_value(fields, "requirements_json")
-        responsibilities = cls._list_value(fields, "responsibilities_json")
         formal_values = {
             field: cls._list_value(fields, field)
             for field in ("requirements_json", "responsibilities_json", "skills_json", "benefits_json")
@@ -124,41 +122,10 @@ class CsvJobRepository:
             item if isinstance(item, SemanticFact) else SemanticFact.model_validate(item)
             for item in semantic_facts or []
         ]
-        confirmed_pairs = {
-            (fact.value, SEMANTIC_FIELD_BY_CATEGORY.get(fact.category))
-            for fact in parsed_facts
-            if fact.source_type == "user_confirmed"
-        }
-
-        misplaced_requirements = [
-            fact.value
-            for item in requirements
-            for fact in classify_atomic_text(item)
-            if fact.category == "responsibility"
-            and (item, "requirements_json") not in confirmed_pairs
-        ]
-        if misplaced_requirements:
-            detail = "、".join(misplaced_requirements)
-            if requirements and not responsibilities:
-                raise SemanticValidationError(
-                    f"任职要求非空但岗位职责为空，且内容明显是动作型职责：{detail}"
-                )
-            raise SemanticValidationError(f"任职要求包含动作型职责，请重新分类或确认：{detail}")
-
-        misplaced_responsibilities = [
-            fact.value
-            for item in responsibilities
-            for fact in classify_atomic_text(item)
-            if fact.category == "requirement"
-            and (item, "responsibilities_json") not in confirmed_pairs
-        ]
-        if misplaced_responsibilities:
-            detail = "、".join(misplaced_responsibilities)
-            raise SemanticValidationError(f"岗位职责包含候选人资格表达，请重新分类或确认：{detail}")
-
         for fact in parsed_facts:
             containing_fields = [
-                field for field, values in formal_values.items() if fact.value in values
+                field for field, values in formal_values.items()
+                if semantic_key(fact.value) in {semantic_key(value) for value in values}
             ]
             if not containing_fields:
                 continue
