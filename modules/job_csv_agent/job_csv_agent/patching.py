@@ -122,10 +122,22 @@ def changed_fields(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
     return {field for field in set(before) | set(after) if before.get(field) != after.get(field)}
 
 
-def _field_has_evidence(field: str, source_text: str, evidence: Iterable[EvidenceSpan]) -> bool:
-    source = clean_markdown(source_text)
+def _span_source(
+    span: EvidenceSpan, source_text: str, source_messages: dict[str, str] | None,
+) -> str:
+    if span.source_message_id and source_messages:
+        return clean_markdown(source_messages.get(span.source_message_id, ""))
+    return clean_markdown(source_text)
+
+
+def _field_has_evidence(
+    field: str, source_text: str, evidence: Iterable[EvidenceSpan],
+    source_messages: dict[str, str] | None = None,
+) -> bool:
     return any(
-        span.field == field and clean_markdown(span.text) in source
+        span.field == field and clean_markdown(span.text) in _span_source(
+            span, source_text, source_messages,
+        )
         for span in evidence
     )
 
@@ -136,12 +148,15 @@ def sanitize_model_patch(
     mentioned_fields: list[str],
     evidence_spans: list[EvidenceSpan],
     ignored_fragments: list[IgnoredFragment],
+    source_messages: dict[str, str] | None = None,
 ) -> DraftPatch:
     """Enforce source evidence and ignored-fragment boundaries in deterministic code."""
     data = patch.model_dump(mode="python")
-    source = clean_markdown(source_text)
+    sources = [clean_markdown(source_text)]
+    sources.extend(clean_markdown(value) for value in (source_messages or {}).values())
+    source = "\n".join(value for value in sources if value)
     evidence_by_field = {
-        field: _field_has_evidence(field, source_text, evidence_spans)
+        field: _field_has_evidence(field, source_text, evidence_spans, source_messages)
         for field in mentioned_fields
     }
     closed_values = closed_field_values(source_text)
@@ -167,11 +182,12 @@ def sanitize_model_patch(
             directly_present = value in source
             supported_span = any(
                 span.field == field
-                and clean_markdown(span.text) in source
+                and clean_markdown(span.text) in _span_source(span, source_text, source_messages)
                 and (_matches(value, span.text) or text_key(value) in text_key(span.text))
                 for span in evidence_spans
             )
-            if directly_present or supported_span or field not in mentioned_fields:
+            normalized = item.get("source") == "normalized"
+            if directly_present or supported_span or normalized or field not in mentioned_fields:
                 item["value"] = value
                 kept.append(item)
         if kept:

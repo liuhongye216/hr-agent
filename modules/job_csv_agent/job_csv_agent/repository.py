@@ -40,8 +40,10 @@ class CsvJobRepository:
             else:
                 frame = pd.DataFrame(columns=BUSINESS_COLUMNS)
             missing = [column for column in BUSINESS_COLUMNS if column not in frame.columns]
-            if missing:
-                raise ValueError(f"CSV schema 缺少字段：{', '.join(missing)}")
+            # Forward-compatible schema migration: legacy CSV files gain new editable
+            # columns in memory and are rewritten only during the next normal mutation.
+            for column in missing:
+                frame[column] = "[]" if column in JSON_FIELDS else ""
             if frame["job_id"].duplicated().any():
                 raise ValueError("CSV 中存在重复 job_id，已拒绝写入")
             yield frame.loc[:, list(BUSINESS_COLUMNS)].copy()
@@ -222,6 +224,8 @@ class CsvJobRepository:
             "recruitment", "employment", "work_mode", "education_min_level",
             "experience_min_months", "experience_max_months", "requirements_json",
             "responsibilities_json", "skills_json", "certificates_json", "benefits_json",
+            "preferred_requirements_json", "not_required_requirements_json",
+            "student_status_json", "internship_min_months", "onsite_days_per_week",
             "source_url",
         )
         row = self.get(job_id)

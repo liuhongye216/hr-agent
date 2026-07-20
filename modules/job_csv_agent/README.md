@@ -15,13 +15,20 @@ patch 应用、字段覆盖校验、版本化确认、查询白名单和 CSV 原
 - `can_confirm`：只有最新成功预览可确认。
 
 每轮结构化结果包含 `intent`、`patch`、`mentioned_fields`、`evidence_spans`、
-`ignored_fragments` 和 `clarification_question`。控制器先保存本轮前草稿，再规范化和应用 patch，
-然后逐项检查用户明确声明的字段是否真正落入草稿。未落实时自动重试一次；仍失败则恢复本轮前
-草稿、撤销确认资格，并返回“本轮字段未成功应用，尚未保存”。
+`mentions`、`ignored_fragments`、`unresolved_fragments` 和 `clarification_question`。控制器先将
+原子 mention 规范化为 patch，再逐项检查明确声明的字段是否真正落入草稿。未落实时只重试失败
+字段；成功字段会保留，失败字段进入 `unresolved_fragments` 并撤销确认资格。
 
-`normalization.py` 集中处理中文经验年/月、招聘类型和最低学历等封闭字段。长文本职责、要求、
-技能和福利仍由模型按原文分类；代码只做证据校验、Markdown 包装清理、增量 patch 和去重，
-不会根据岗位名称生成默认内容。
+保存状态拆分为 `storage_valid` 与 `extraction_complete`：前者只表示数据库最低字段齐全，后者表示
+原文信息已经全部归类。只有两者同时成立且无待确认歧义时才允许确认写入。
+
+`normalization.py` 集中处理中文经验范围、招聘类型、最低学历、学籍、实习期限、每周到岗天数、
+共享谓词下的并列技能，以及 required/preferred/not_required 条件。历史纠错通过带
+`source_message_id` 的证据引用用户原文；不会把助手生成的草稿当成事实来源。
+
+新增 CSV 字段包括 `preferred_requirements_json`、`not_required_requirements_json`、
+`student_status_json`、`internship_min_months` 和 `onsite_days_per_week`。旧 CSV 在读取时以内存补列
+方式兼容，并只在下一次正常写操作时写回新表头。
 
 ## 查询
 

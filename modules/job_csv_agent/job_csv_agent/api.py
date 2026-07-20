@@ -65,6 +65,14 @@ def _response(session_id: str, state: AgentState) -> ChatResponse:
         ],
         can_confirm=state.get("can_confirm", False),
         can_cancel=state.get("can_cancel", False),
+        storage_valid=state.get("storage_valid", False),
+        extraction_complete=state.get("extraction_complete", True),
+        unresolved_fragments=[
+            str(item.get("text", "")) for item in state.get("unresolved_fragments", [])
+        ],
+        requested_fields=[
+            FIELD_LABELS.get(field, field) for field in state.get("requested_fields", [])
+        ],
         state_version=state.get("state_version", 0),
     )
 

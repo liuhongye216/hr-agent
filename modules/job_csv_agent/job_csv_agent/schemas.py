@@ -12,12 +12,15 @@ BUSINESS_COLUMNS = (
     "recruitment", "employment", "work_mode", "education_min_level",
     "experience_min_months", "experience_max_months", "requirements_json",
     "responsibilities_json", "skills_json", "certificates_json", "benefits_json",
+    "preferred_requirements_json", "not_required_requirements_json",
+    "student_status_json", "internship_min_months", "onsite_days_per_week",
     "source_url", "scraped_at", "content_hash", "extraction_mode",
 )
 
 JSON_FIELDS = frozenset({
     "requirements_json", "responsibilities_json", "skills_json",
-    "certificates_json", "benefits_json",
+    "certificates_json", "benefits_json", "preferred_requirements_json",
+    "not_required_requirements_json", "student_status_json",
 })
 SYSTEM_FIELDS = frozenset({"job_id", "scraped_at", "content_hash", "extraction_mode"})
 EDITABLE_FIELDS = tuple(column for column in BUSINESS_COLUMNS if column not in SYSTEM_FIELDS)
@@ -35,6 +38,9 @@ FIELD_LABELS = {
     "experience_max_months": "最高经验（月）", "requirements_json": "任职要求",
     "responsibilities_json": "岗位职责", "skills_json": "技能要求",
     "certificates_json": "证书", "benefits_json": "福利", "source_url": "来源链接",
+    "preferred_requirements_json": "加分项", "not_required_requirements_json": "非必需条件",
+    "student_status_json": "学籍状态", "internship_min_months": "最短实习期（月）",
+    "onsite_days_per_week": "每周到岗天数",
     "job_content": "任职要求或岗位职责",
 }
 
@@ -88,11 +94,16 @@ class JobFields(BaseModel):
     education_min_level: int | None = Field(default=None, ge=0, le=6)
     experience_min_months: int | None = Field(default=None, ge=0)
     experience_max_months: int | None = Field(default=None, ge=0)
+    internship_min_months: int | None = Field(default=None, ge=0)
+    onsite_days_per_week: int | None = Field(default=None, ge=0, le=7)
     requirements_json: list[str] | None = None
     responsibilities_json: list[str] | None = None
     skills_json: list[str] | None = None
     certificates_json: list[str] | None = None
     benefits_json: list[str] | None = None
+    preferred_requirements_json: list[str] | None = None
+    not_required_requirements_json: list[str] | None = None
+    student_status_json: list[str] | None = None
     source_url: str | None = None
 
     @field_validator("title", "company_name")
@@ -157,7 +168,8 @@ class ListReplacement(BaseModel):
 
     field: Literal[
         "requirements_json", "responsibilities_json", "skills_json",
-        "certificates_json", "benefits_json",
+        "certificates_json", "benefits_json", "preferred_requirements_json",
+        "not_required_requirements_json", "student_status_json",
     ]
     match: str = Field(min_length=1)
     value: str = Field(min_length=1)
@@ -169,6 +181,44 @@ class EvidenceSpan(BaseModel):
 
     field: str = Field(min_length=1)
     text: str = Field(min_length=1)
+    source_message_id: str | None = None
+
+
+RequirementModality = Literal["required", "preferred", "not_required"]
+
+
+class AtomicMention(BaseModel):
+    """One source-grounded fact before it is converted into an incremental patch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str = Field(min_length=1)
+    raw_text: str = Field(min_length=1)
+    value: Any | None = None
+    items: list[str] = Field(default_factory=list)
+    operation: Literal["set", "append", "remove"] = "set"
+    modality: RequirementModality = "required"
+    source: ModelPatchSource = "explicit"
+    source_message_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_mention(self) -> "AtomicMention":
+        if self.field not in EDITABLE_FIELDS:
+            raise ValueError(f"atomic mention contains unknown field: {self.field}")
+        if self.value is None and not self.items:
+            raise ValueError("atomic mention requires value or items")
+        if self.field not in JSON_FIELDS and self.items:
+            raise ValueError("scalar atomic mention cannot contain items")
+        return self
+
+
+class UnresolvedFragment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    suggested_fields: list[str] = Field(default_factory=list)
+    source_message_id: str | None = None
 
 
 class IgnoredFragment(BaseModel):
@@ -230,14 +280,18 @@ class StructuredCommand(BaseModel):
     query_plan: QueryPlan | None = None
     selection_index: int | None = Field(default=None, ge=1)
     patch: DraftPatch = Field(default_factory=DraftPatch)
+    mentions: list[AtomicMention] = Field(default_factory=list)
     mentioned_fields: list[str] = Field(default_factory=list)
     evidence_spans: list[EvidenceSpan] = Field(default_factory=list)
     ignored_fragments: list[IgnoredFragment] = Field(default_factory=list)
+    unresolved_fragments: list[UnresolvedFragment] = Field(default_factory=list)
+    extraction_complete: bool = True
     pending_decision: PendingDecision | None = None
     clarification_question: str | None = None
     requires_clarification: bool = False
     natural_reply: str | None = None
     task_relation: Literal["continue_current", "start_new", "not_applicable"] = "not_applicable"
+    clarification_fields: list[str] = Field(default_factory=list)
 
     @field_validator("mentioned_fields")
     @classmethod
@@ -245,6 +299,14 @@ class StructuredCommand(BaseModel):
         invalid = sorted(set(value) - set(EDITABLE_FIELDS))
         if invalid:
             raise ValueError(f"mentioned_fields contains unknown fields: {', '.join(invalid)}")
+        return list(dict.fromkeys(value))
+
+    @field_validator("clarification_fields")
+    @classmethod
+    def validate_clarification_fields(cls, value: list[str]) -> list[str]:
+        invalid = sorted(set(value) - set(EDITABLE_FIELDS))
+        if invalid:
+            raise ValueError(f"clarification_fields contains unknown fields: {', '.join(invalid)}")
         return list(dict.fromkeys(value))
 
 
@@ -260,6 +322,7 @@ class LLMInterpretation(StructuredCommand):
             | set(self.patch.remove_items) | set(self.patch.clear_fields)
             | {item.field for item in self.patch.replace_items}
         )
+        touched |= {item.field for item in self.mentions}
         if self.pending_decision is not None:
             pending = self.pending_decision.patch
             touched |= (
@@ -274,6 +337,8 @@ class LLMInterpretation(StructuredCommand):
         missing_evidence = sorted(set(self.mentioned_fields) - evidenced)
         if missing_evidence:
             raise ValueError(f"mentioned_fields missing evidence: {', '.join(missing_evidence)}")
+        if self.unresolved_fragments and self.extraction_complete:
+            raise ValueError("extraction_complete cannot be true with unresolved_fragments")
         return self
 
 
@@ -290,4 +355,8 @@ class ChatResponse(BaseModel):
     candidates: list[dict[str, str]] = Field(default_factory=list)
     can_confirm: bool = False
     can_cancel: bool = False
+    storage_valid: bool = False
+    extraction_complete: bool = True
+    unresolved_fragments: list[str] = Field(default_factory=list)
+    requested_fields: list[str] = Field(default_factory=list)
     state_version: int = Field(default=0, ge=0)
