@@ -16,16 +16,11 @@ import portalocker
 
 from .schemas import (
     BUSINESS_COLUMNS, CREATE_CONTENT_FIELDS, EDITABLE_FIELDS, JSON_FIELDS, JobFields,
-    REQUIRED_CREATE_FIELDS, SemanticFact,
+    REQUIRED_CREATE_FIELDS,
 )
-from .semantics import SEMANTIC_FIELD_BY_CATEGORY, classify_atomic_text
 
 
 class JobNotFoundError(LookupError):
-    pass
-
-
-class SemanticValidationError(ValueError):
     pass
 
 
@@ -45,8 +40,10 @@ class CsvJobRepository:
             else:
                 frame = pd.DataFrame(columns=BUSINESS_COLUMNS)
             missing = [column for column in BUSINESS_COLUMNS if column not in frame.columns]
-            if missing:
-                raise ValueError(f"CSV schema 缺少字段：{', '.join(missing)}")
+            # Forward-compatible schema migration: legacy CSV files gain new editable
+            # columns in memory and are rewritten only during the next normal mutation.
+            for column in missing:
+                frame[column] = "[]" if column in JSON_FIELDS else ""
             if frame["job_id"].duplicated().any():
                 raise ValueError("CSV 中存在重复 job_id，已拒绝写入")
             yield frame.loc[:, list(BUSINESS_COLUMNS)].copy()
@@ -98,82 +95,6 @@ class CsvJobRepository:
             payload[key] = value
         return payload
 
-    @staticmethod
-    def _list_value(fields: dict[str, Any], key: str) -> list[str]:
-        value = fields.get(key, [])
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError as exc:
-                raise SemanticValidationError(f"{key} 不是有效 JSON 数组") from exc
-        return [str(item).strip() for item in value or [] if str(item).strip()]
-
-    @classmethod
-    def _validate_semantics(
-        cls,
-        fields: dict[str, Any],
-        semantic_facts: list[dict[str, Any] | SemanticFact] | None = None,
-    ) -> None:
-        requirements = cls._list_value(fields, "requirements_json")
-        responsibilities = cls._list_value(fields, "responsibilities_json")
-        formal_values = {
-            field: cls._list_value(fields, field)
-            for field in ("requirements_json", "responsibilities_json", "skills_json", "benefits_json")
-        }
-        parsed_facts = [
-            item if isinstance(item, SemanticFact) else SemanticFact.model_validate(item)
-            for item in semantic_facts or []
-        ]
-        confirmed_pairs = {
-            (fact.value, SEMANTIC_FIELD_BY_CATEGORY.get(fact.category))
-            for fact in parsed_facts
-            if fact.source_type == "user_confirmed"
-        }
-
-        misplaced_requirements = [
-            fact.value
-            for item in requirements
-            for fact in classify_atomic_text(item)
-            if fact.category == "responsibility"
-            and (item, "requirements_json") not in confirmed_pairs
-        ]
-        if misplaced_requirements:
-            detail = "、".join(misplaced_requirements)
-            if requirements and not responsibilities:
-                raise SemanticValidationError(
-                    f"任职要求非空但岗位职责为空，且内容明显是动作型职责：{detail}"
-                )
-            raise SemanticValidationError(f"任职要求包含动作型职责，请重新分类或确认：{detail}")
-
-        misplaced_responsibilities = [
-            fact.value
-            for item in responsibilities
-            for fact in classify_atomic_text(item)
-            if fact.category == "requirement"
-            and (item, "responsibilities_json") not in confirmed_pairs
-        ]
-        if misplaced_responsibilities:
-            detail = "、".join(misplaced_responsibilities)
-            raise SemanticValidationError(f"岗位职责包含候选人资格表达，请重新分类或确认：{detail}")
-
-        for fact in parsed_facts:
-            containing_fields = [
-                field for field, values in formal_values.items() if fact.value in values
-            ]
-            if not containing_fields:
-                continue
-            if fact.source_type == "inferred":
-                raise SemanticValidationError(f"推断信息未经用户确认，禁止写入：{fact.value}")
-            if fact.category == "unknown":
-                raise SemanticValidationError(f"待澄清信息禁止写入：{fact.value}")
-            if fact.needs_confirmation and fact.source_type != "user_confirmed":
-                raise SemanticValidationError(f"信息仍需用户确认，禁止写入：{fact.value}")
-            expected = SEMANTIC_FIELD_BY_CATEGORY.get(fact.category)
-            if expected and expected not in containing_fields:
-                raise SemanticValidationError(
-                    f"语义事实“{fact.value}”分类为 {fact.category}，不能写入 {', '.join(containing_fields)}"
-                )
-
     @classmethod
     def _validate_complete_row(
         cls, row: dict[str, Any], required_fields: tuple[str, ...] = REQUIRED_CREATE_FIELDS,
@@ -194,18 +115,13 @@ class CsvJobRepository:
                 raise JobNotFoundError(job_id)
             return matches.iloc[0].to_dict()
 
-    def create(
-        self,
-        fields: dict[str, Any],
-        semantic_facts: list[dict[str, Any] | SemanticFact] | None = None,
-    ) -> dict[str, str]:
+    def create(self, fields: dict[str, Any]) -> dict[str, str]:
         validated = JobFields.model_validate(fields).model_dump(exclude_none=True)
         missing = [key for key in REQUIRED_CREATE_FIELDS if not validated.get(key)]
         if missing:
             raise ValueError(f"新建岗位缺少必填字段：{', '.join(missing)}")
         if not any(validated.get(key) for key in CREATE_CONTENT_FIELDS):
             raise ValueError("新建岗位至少需要一项任职要求、岗位职责或可抽取的完整 JD 内容")
-        self._validate_semantics(validated, semantic_facts)
         values = self._serialize_fields(validated)
         with self._locked_frame() as frame:
             job_id = f"job_{uuid.uuid4().hex[:16]}"
@@ -230,10 +146,8 @@ class CsvJobRepository:
         job_id: str,
         fields: dict[str, Any],
         clear_fields: list[str] | None = None,
-        semantic_facts: list[dict[str, Any] | SemanticFact] | None = None,
     ) -> tuple[dict[str, str], dict[str, str]]:
         validated = JobFields.model_validate(fields).model_dump(exclude_none=True)
-        self._validate_semantics(validated, semantic_facts)
         values = self._serialize_fields(validated)
         for key in clear_fields or []:
             if key not in EDITABLE_FIELDS:
@@ -270,6 +184,63 @@ class CsvJobRepository:
             deleted = frame.loc[indexes[0]].to_dict()
             self._atomic_write(frame.drop(index=indexes[0]).reset_index(drop=True))
             return deleted
+
+    @staticmethod
+    def _filter_frame(frame: pd.DataFrame, filters: dict[str, str]) -> pd.DataFrame:
+        result = frame
+        for field in ("company_name", "title", "city"):
+            value = str(filters.get(field, "")).strip().casefold()
+            if value:
+                result = result.loc[
+                    result[field].astype(str).str.casefold().str.contains(value, regex=False)
+                ]
+        recruitment = str(filters.get("recruitment", "")).strip().casefold()
+        if recruitment:
+            result = result.loc[result["recruitment"].astype(str).str.casefold() == recruitment]
+        return result
+
+    def count(self, filters: dict[str, str] | None = None) -> int:
+        with self._locked_frame() as frame:
+            return int(len(self._filter_frame(frame, filters or {})))
+
+    def list_summaries(
+        self, filters: dict[str, str] | None = None, limit: int = 10,
+    ) -> list[dict[str, str]]:
+        safe_limit = max(1, min(int(limit), 10))
+        with self._locked_frame() as frame:
+            matches = self._filter_frame(frame, filters or {}).head(safe_limit)
+            return matches.loc[:, ["company_name", "title", "city"]].to_dict(orient="records")
+
+    def find_job_ids(self, filters: dict[str, str] | None = None, limit: int = 10) -> list[str]:
+        safe_limit = max(1, min(int(limit), 10))
+        with self._locked_frame() as frame:
+            matches = self._filter_frame(frame, filters or {}).head(safe_limit)
+            return [str(value) for value in matches["job_id"].tolist()]
+
+    def get_public_detail(self, job_id: str) -> dict[str, Any]:
+        public_fields = (
+            "job_id", "company_name", "title", "city", "work_address",
+            "salary_min", "salary_max", "salary_currency", "salary_period",
+            "recruitment", "employment", "work_mode", "education_min_level",
+            "experience_min_months", "experience_max_months", "requirements_json",
+            "responsibilities_json", "skills_json", "certificates_json", "benefits_json",
+            "preferred_requirements_json", "not_required_requirements_json",
+            "student_status_json", "internship_min_months", "onsite_days_per_week",
+            "source_url",
+        )
+        row = self.get(job_id)
+        detail: dict[str, Any] = {}
+        for field in public_fields:
+            value: Any = row.get(field, "")
+            if value in (None, ""):
+                continue
+            if field in JSON_FIELDS:
+                try:
+                    value = json.loads(value) if isinstance(value, str) else list(value)
+                except (json.JSONDecodeError, TypeError):
+                    value = []
+            detail[field] = value
+        return detail
 
     def search(self, query: str, limit: int = 5) -> list[dict[str, str]]:
         needle = " ".join(query.casefold().split())

@@ -4,19 +4,20 @@
 
 ## 当前状态
 
-| 能力 | 状态 | 说明 |
-|---|---|---|
-| JD JSONL/CSV 数据准备 | 已实现 | 支持规则模式与需显式授权的 DeepSeek 混合抽取 |
-| 职责/要求语义识别 | 已实现 | 原子句拆分、证据与来源标记、复合句重分类、待确认推断建议 |
-| 自然语言岗位新增/修改/删除 | 已实现（MVP） | LangGraph 多轮状态、候选消歧、预览和明确确认后写入 |
-| CSV Repository | 已实现 | Pydantic 格式校验、独立语义闸门、文件锁、原子替换、内容哈希 |
-| 岗位查询 | 已实现（MVP） | 规则查询优先，LLM 回退；SQL 仅允许受限的只读查询 |
-| FastAPI / Chainlit | 已实现（本地单进程） | Chainlit 只调用 API，不直接读写 CSV |
-| 采集工具 | 已实现（辅助工具） | 登录后单线程采集、断点续采，不绕过验证 |
-| 独立追问服务 | 部分实现 | 高价值追问已在 `job_csv_agent` 内实现；独立模块仍是边界占位 |
-| 版本化 JobPatch、软删除、审计日志 | 未实现 | 当前删除为物理删除，CSV 不保存岗位版本 |
-| 候选人检索与统一匹配 | 未实现 | `retrieval` 与 `matching_gateway` 目前只有设计边界 |
-| 生产认证、权限、持久会话 | 未实现 | 当前无 RBAC；API 会话保存在单进程内存中 |
+| 能力                              | 状态                 | 说明                                                         |
+| --------------------------------- | -------------------- | ------------------------------------------------------------ |
+| JD JSONL/CSV 数据准备             | 已实现               | 支持规则模式与需显式授权的 DeepSeek 混合抽取                 |
+| 职责/要求语义识别                 | 已实现               | 章节感知事实、证据覆盖、受约束改写与跨字段一致性校验         |
+| 自然语言岗位新增/修改/删除        | 已实现（MVP）        | 类型化路由、任务中断恢复、候选消歧和明确确认后写入           |
+| CSV Repository                    | 已实现               | Pydantic 格式校验、独立语义闸门、文件锁、原子替换、内容哈希  |
+| 岗位查询与统计                    | 已实现（MVP）        | 单值/表格/详情/澄清结果协议；规则优先，受限只读 SQL          |
+| 帮助与自然对话                    | 已实现（MVP）        | 状态感知回复；闲聊不进入草稿，创建任务可安全恢复             |
+| FastAPI / Chainlit                | 已实现（本地单进程） | Chainlit 只调用 API，不直接读写 CSV                          |
+| 采集工具                          | 已实现（辅助工具）   | 登录后单线程采集、断点续采，不绕过验证                       |
+| 独立追问服务                      | 部分实现             | 高价值追问已在`job_csv_agent` 内实现；独立模块仍是边界占位 |
+| 版本化 JobPatch、软删除、审计日志 | 未实现               | 当前删除为物理删除，CSV 不保存岗位版本                       |
+| 候选人检索与统一匹配              | 未实现               | `retrieval` 与 `matching_gateway` 目前只有设计边界       |
+| 生产认证、权限、持久会话          | 未实现               | 当前无 RBAC；API 会话保存在单进程内存中                      |
 
 详细盘点与后续建议见 [docs/STATUS.md](docs/STATUS.md)。
 
@@ -26,12 +27,20 @@
 本地 data/source/jobs.jsonl
   → jd_text2sql：规则/混合抽取
   → data/business/jobs.csv
-  → job_csv_agent：自然语言 CRUD、语义校验、预览确认
+  → job_csv_agent：目标路由、查询/统计、JD 语义编辑、预览确认
   → runtime/jd_text2sql.sqlite（可重建，不提交）
   → 规则优先 + LLM 回退的只读查询
 ```
 
 业务 CSV 继续使用兼容的 JSON 字符串数组列。会话内部使用带 `category / importance / source_type / evidence_text / needs_confirmation` 的语义事实；只有明确事实或用户已确认事实能够投影到正式字段。
+
+## Agent 架构边界
+
+- LLM 负责全部开放式目标理解、字段抽取、JD 章节/事实分类、受约束改写和自然回复；确定性快速路径只处理确认、取消和候选序号。
+- 查询工具返回 `scalar / table / detail / clarification` 类型化结果，聚合结果不会再按岗位行数渲染。
+- 确定性代码负责 Pydantic 字段格式、原文证据、事实到字段的一致性、SQL 防护和写入确认，不再使用关键词或正则猜岗位业务含义。
+- `CsvJobRepository` 仍是唯一正式写入入口；LLM 无法直接操作 CSV、SQLite 或绕过确认。
+- 未配置或无法连接外部模型时，现有草稿保持不变并返回安全降级说明；不会用正则猜测岗位字段。
 
 ## 快速开始
 
@@ -80,7 +89,7 @@ $env:PYTHONPATH = "modules\job_csv_agent;modules\jd_text2sql"
 python -m pytest -q modules\job_csv_agent\tests modules\jd_text2sql\tests
 ```
 
-当前完整测试共 33 项，覆盖语义分类、职责-only 草稿、推断确认边界、CRUD、确认流程、CSV 同步、Text2SQL 与 SQL 安全闸门。
+当前跨模块回归共 98 项，覆盖 LLM 类型化协议、原文证据、低置信度/不可用降级、创建态任务区分、自然语言统计、条件聚合、CRUD、确认流程、CSV 同步、Text2SQL 与 SQL 安全闸门。
 
 ## 目录
 

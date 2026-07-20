@@ -6,39 +6,56 @@ from typing import Any
 from pydantic import ValidationError
 
 from .config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, is_valid_api_key
-from .schemas import StructuredCommand
-from .semantics import reconcile_command_semantics
+from .schemas import LLMInterpretation, StructuredCommand
 
 
-SYSTEM_PROMPT = """你是公司侧招聘岗位管理助手，只把用户文本转换为结构化命令，绝不执行 CSV/SQL/文件操作。
-intent 只能是 create/update/delete/search/confirm/cancel/unknown。处理岗位内容时必须先拆成每句只含一个语义的原子句，再逐句生成 semantic_facts，最后投影业务字段。
+SYSTEM_PROMPT = """你是公司侧招聘岗位管理助手。你只理解用户话语并输出类型化 JSON；不得读写文件、生成或执行 SQL，也不得替用户确认保存。
 
-语义定义：
-- responsibility（岗位职责）：员工入职后要执行的动作、承担的任务或交付的结果。常见动词：负责、完成、搭建、制定、推进、交付、参与、建设、训练、评估。
-- requirement（任职要求）：候选人入职前要具备的学历、经验、能力、知识、证书或行为特质。常见表达：具备、熟悉、掌握、学历、经验、证书、优先。
-- skill（技能）：用户明确提到的工具、技术、语言或专业技能标签；技能标签可与一条 requirement 共用 evidence_text，但不能凭常识补全。
-- benefit（福利）：公司向员工提供的薪酬之外待遇，如五险一金、年终奖、带薪年假。
-- unknown（待澄清）：原文不足以可靠分类或存在关键歧义；必须 needs_confirmation=true，不能强塞入业务字段。
+每轮必须结合 context 中的 phase、完整 draft、provenance、last_assistant_question、recent_messages 和 ready_to_save。不要假装忘记已有草稿。
 
-每条 semantic_fact 必须包含 value、category、importance(must/preferred/neutral/unknown)、source_type(explicit/inferred/user_confirmed)、evidence_text、needs_confirmation。
-- explicit：用户原文明确事实；evidence_text 必须对应原文。
-- inferred：根据职责推测的候选能力，只能作为建议且 needs_confirmation=true。
-- user_confirmed：用户在当前上下文中明确确认过的建议。
-只有 explicit 且 category 明确，或 user_confirmed 的事实，才可投影到 requirements_json、responsibilities_json、skills_json、benefits_json。inferred 和 unknown 一律不得投影。不得因为旧流程曾要求 requirements_json 非空而伪造任职要求，也不得把常识推断说成用户明确提供。
+字段更新必须使用增量 DraftPatch：
+- set_fields 仅设置标量字段，并在 set_sources 标注 explicit/contextual/normalized。
+- append_items 向列表追加，不得返回完整列表覆盖旧值。
+- “还有、以及、另外”默认追加；“改成、不是……而是……、仅限于”使用 replace_items/remove_items。
+- 用户对上一轮问题的简短回答可标为 contextual。例如上一轮问年龄限制是否硬性，本轮“硬性的”应更新原年龄条目。
+- 格式换算标为 normalized，例如两年=24个月、月薪范围的周期=month。
+- 明确字段和明确列表条目立即放入 patch。即使同轮还有不确定内容，也不能丢弃确定 patch。
 
-正例、反例与复合句拆分：
-- “从0开始预训练大模型” -> responsibility/neutral/explicit；不是 requirement。
-- “具备从0开始预训练大模型的经验” -> requirement/must/explicit；不是 responsibility。
-- “负责训练数据清洗和模型预训练” -> responsibility/neutral/explicit。
-- “熟悉 Python 和 PyTorch” -> 一条 requirement/must/explicit；还可生成 Python、PyTorch 两条 skill/explicit 标签。
-- “参与模型预训练，有分布式训练经验优先” -> 拆成 responsibility“参与模型预训练”和 requirement/preferred“有分布式训练经验优先”。不得保留成一条。
-- “本科及以上学历，负责训练平台建设” -> 拆成 requirement/must“本科及以上学历”和 responsibility/neutral“负责训练平台建设”。
-- “提供五险一金，参与推荐系统开发” -> 拆成 benefit 与 responsibility。
-- 反例：“从0开始预训练大模型”不能改写成“具备大模型预训练经验”；“负责平台建设”不能写入 requirements_json；“熟悉 Python”不能写入 responsibilities_json。
+在 patch 之前先输出原子 mentions。每个 mention 只表达一个标量事实或一个共享谓词下的并列组：
+- “5到8年经验”同时产生 experience_min_months=60 和 experience_max_months=96。
+- “熟悉Java、Spring Boot、MySQL和Redis”是一个 skills_json mention，items 必须包含四项；并列项继承“熟悉”。
+- requirements_json mention 的 modality 必须是 required、preferred 或 not_required。
+- “必须/至少/需要”是 required；“加分项/优先/非硬性要求”是 preferred；“不要求/没有……也可以/无需”是 not_required。
+- 学历只写 education_min_level；“本科或研究生在读”同时写 education_min_level=4 和 student_status_json=[本科在读,研究生在读]，不要把纯学历句重复写入 requirements_json。
+- 连续实习月份写 internship_min_months，每周到岗天数写 onsite_days_per_week。
 
-当只明确给出“从0开始预训练大模型”一类职责时，职责保持 explicit；可以给出 Python、深度学习框架、Transformer、数据处理、分布式训练等少量 inferred 技能建议，并生成高信息量 clarification_questions，询问“从0”含义、负责环节、技能必需性及是否要求既有大规模/分布式训练经验。建议绝不进入正式 JSON 字段。
+严格遵守来源边界：
+- explicit、contextual、normalized 可写入正式 patch。
+- 不得根据岗位名称生成职责、要求、技能、福利或建议；没有原文证据的内容不得进入 patch。
+- 绝不能根据职业自行补充年龄、性别、学历、经验年限、证书、薪资、班次或硬性技能。
+- 用户明确说出的年龄等限制仍属于 explicit，应正常写入。
+- evidence_spans 默认引用本轮；重新识别历史信息时，必须填写 source_message_id，且证据逐字来自 context.source_messages 中对应的用户原文。
 
-普通字段约定：title 岗位名；company_name 公司名；city 城市；work_address 详细地址；salary_min/salary_max 换算成人民币数值（20k-30k/月 => 20000,30000,CNY,month）；education_min_level 不限=0、初中=1、高中/中专=2、大专=3、本科=4、硕士=5、博士=6；experience_*_months 使用月。用户明确清空字段时写 clear_fields。修改/删除的定位文字写 search_query，仅把真正变更写 fields。不得生成 job_id、content_hash、scraped_at、extraction_mode。未明确的信息保持 null 或空数组。"""
+明确表达不得降级成建议或确认项。例如“在黑钢国际当保镖，月薪6w”必须立即写入 company_name=黑钢国际、title=保镖、salary_min=60000、salary_max=60000、salary_period=month；不得询问这些字段是否确定。“招募实习生”只表示实习招聘/用工类型，不得自动产生“在校学生或应届毕业生”、每周出勤天数或实习期限。
+
+排班、出勤、工作时间、跟随负责人行程等是工作条件，不是岗位职责。连续实习月份和每周到岗天数优先写专用字段；其他无法单独存储的工作条件写入 requirements_json，例如“出勤根据boss时间安排”规范为“工作时间根据负责人安排”。
+
+只有真正的 yes/no 歧义才能返回 pending_decision，其中必须携带用户确认后才应用的完整增量 patch。不要只在 clarification_question 文本中提到一个尚未写入的值。开放式补充问题只使用 clarification_question，不创建空的 pending_decision。
+
+每个有业务意义的原文片段必须进入 mentions/evidence、ignored_fragments 或 unresolved_fragments。只要还有 unresolved_fragments，extraction_complete 必须为 false；全部覆盖后才为 true。需要追问时用 clarification_fields 标明目标字段。用户答非所问时，仍提取其新增信息，同时继续追问目标字段。context.repair 存在时，重新分析列出的历史 source_message_ids；“再看看、漏了、学历呢、技能呢”不是闲聊。
+
+不要重复追问公司名称、岗位名称、薪资、经验等已明确字段。requires_clarification 只表示还有一个真正影响写入的歧义；clarification_question 每轮最多一个。用户说“确认、是的、对、可以”时，结合 context.pending_decision 判断是在接受待确认 patch；没有待确认 patch 且 ready_to_save=true 时才表示最终保存。natural_reply 用于查询、帮助、闲聊或超范围回答。
+
+结构化结果还必须满足：
+- mentioned_fields 列出本轮用户明确声明的每个业务字段。
+- evidence_spans 为每个明确字段给出逐字证据；历史证据必须带 source_message_id。
+- ignored_fragments 记录已识别但当前 schema 不保存的片段，例如部门名称。
+- 完整 JD 的编号职责和要求必须逐条原样保留，不得概括、合并或遗漏；清理 Markdown 包装符号即可。
+- 查询只生成 QueryPlan（count/list/detail 及白名单过滤字段），绝不能生成 SQL。
+- 用户未明确要求“详情”时，查询 mode 必须为 list 或 count。
+
+意图：create 新建；update 补充当前草稿或修改已有岗位；delete 删除；search 列表；count 计数；detail 详情；help/conversation/unsupported。创建态内普通补充使用 update + continue_current；明确另起岗位才使用 start_new。“某公司招聘某岗位/招一名某岗位”在没有活动草稿时就是 create，即使用户没有说“新增”。
+"""
 
 
 class LLMConfigurationError(RuntimeError):
@@ -49,23 +66,33 @@ class LLMServiceError(RuntimeError):
     pass
 
 
+def _strip_json_fence(content: str) -> str:
+    content = content.strip()
+    if content.startswith("```"):
+        return content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    return content
+
+
 class StructuredInterpreter:
     def __init__(self, model: str = DEEPSEEK_MODEL) -> None:
         self.model = model
 
-    def extract(self, text: str, context: dict[str, Any]) -> StructuredCommand:
+    @staticmethod
+    def _client() -> Any:
         if not is_valid_api_key(DEEPSEEK_API_KEY):
             raise LLMConfigurationError(
-                "DEEPSEEK_API_KEY 未配置或仍是示例占位值。请在 company_agent/.env 中填写有效密钥，"
-                "然后重启 FastAPI。"
+                "模型暂时不可用：DEEPSEEK_API_KEY 未配置或仍是示例值。岗位草稿已保留，请配置后重试。"
             )
+        from openai import OpenAI
+
+        return OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+
+    def extract(self, text: str, context: dict[str, Any]) -> StructuredCommand:
         from openai import (
-            APIConnectionError, APIStatusError, AuthenticationError, BadRequestError,
-            OpenAI, RateLimitError,
+            APIConnectionError, APIStatusError, AuthenticationError, BadRequestError, RateLimitError,
         )
 
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-        schema = json.dumps(StructuredCommand.model_json_schema(), ensure_ascii=False)
+        schema = json.dumps(LLMInterpretation.model_json_schema(), ensure_ascii=False)
         messages = [
             {"role": "system", "content": f"{SYSTEM_PROMPT}\n只输出符合此 schema 的 JSON：{schema}"},
             {"role": "user", "content": json.dumps({"context": context, "input": text}, ensure_ascii=False)},
@@ -73,39 +100,47 @@ class StructuredInterpreter:
         last_error: Exception | None = None
         for _ in range(3):
             try:
-                response = client.chat.completions.create(
+                response = self._client().chat.completions.create(
                     model=self.model,
                     messages=messages,
                     response_format={"type": "json_object"},
-                    max_tokens=3_000,
+                    max_tokens=4_000,
                     stream=False,
                     extra_body={"thinking": {"type": "disabled"}},
                 )
             except AuthenticationError as exc:
-                raise LLMConfigurationError(
-                    "DeepSeek 鉴权失败，请检查 company_agent/.env 中的 DEEPSEEK_API_KEY，"
-                    "更新后重启 FastAPI。"
-                ) from exc
+                raise LLMConfigurationError("模型鉴权失败，岗位草稿已保留，请检查 API 密钥。") from exc
             except BadRequestError as exc:
-                raise LLMServiceError(
-                    f"DeepSeek 拒绝了请求，请检查模型名 DEEPSEEK_MODEL={self.model} 是否可用。"
-                ) from exc
+                raise LLMServiceError(f"模型拒绝请求，请检查模型名 {self.model}。岗位草稿已保留。") from exc
             except RateLimitError as exc:
-                raise LLMServiceError("DeepSeek 当前限流或额度不足，请稍后重试。") from exc
+                raise LLMServiceError("模型当前限流或额度不足，岗位草稿已保留，请稍后重试。") from exc
             except APIConnectionError as exc:
-                raise LLMServiceError("无法连接 DeepSeek API，请检查网络和 DEEPSEEK_BASE_URL。") from exc
+                raise LLMServiceError("暂时无法连接模型，岗位草稿已保留，请稍后重试。") from exc
             except APIStatusError as exc:
-                raise LLMServiceError(f"DeepSeek API 返回异常状态码 {exc.status_code}。") from exc
-            content = (response.choices[0].message.content or "").strip()
-            if content.startswith("```"):
-                content = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                raise LLMServiceError(f"模型服务返回异常状态 {exc.status_code}，岗位草稿已保留。") from exc
+            content = _strip_json_fence(response.choices[0].message.content or "")
             try:
-                command = StructuredCommand.model_validate_json(content)
-                return reconcile_command_semantics(command, text)
+                return LLMInterpretation.model_validate_json(content)
             except (ValidationError, ValueError) as exc:
                 last_error = exc
                 messages.extend([
                     {"role": "assistant", "content": content or "{}"},
-                    {"role": "user", "content": f"JSON 不符合 schema：{exc}。请重新输出。"},
+                    {"role": "user", "content": f"JSON 不符合类型化协议：{exc}。请修正后完整输出。"},
                 ])
-        raise RuntimeError(f"DeepSeek 未返回有效结构化 JSON：{last_error}")
+        raise LLMServiceError(f"模型未返回有效类型化结果，岗位草稿已保留：{last_error}")
+
+    def respond_to_conversation(self, text: str, context: dict[str, Any]) -> str:
+        response = self._client().chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是招聘岗位助手。根据当前草稿自然简短回答，不得虚构岗位事实或声称已写入数据。",
+                },
+                {"role": "user", "content": json.dumps({"context": context, "input": text}, ensure_ascii=False)},
+            ],
+            max_tokens=500,
+            stream=False,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        return (response.choices[0].message.content or "").strip()

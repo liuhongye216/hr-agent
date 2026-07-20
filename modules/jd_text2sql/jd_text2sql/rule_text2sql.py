@@ -38,6 +38,19 @@ def _salary_number(raw: str, unit: str) -> float:
     return value
 
 
+_COUNT_PATTERNS = (
+    re.compile(r"(?:多少|几(?:个|条|份))(?:岗位|职位|招聘信息|条目|记录)?"),
+    re.compile(r"(?:岗位|职位|招聘信息|条目|记录)(?:的)?(?:数量|总数)"),
+    re.compile(r"(?:统计|总计|合计|数一下|数一数|一共|总共).*(?:岗位|职位|招聘信息|条目|记录)"),
+    re.compile(r"(?:岗位|职位|招聘信息|条目|记录).*(?:统计|总计|合计|多少|数量|总数)"),
+)
+
+
+def is_count_question(question: str) -> bool:
+    compact = "".join(question.split())
+    return any(pattern.search(compact) for pattern in _COUNT_PATTERNS)
+
+
 def generate_rule_sql(question: str, db_path: Path) -> SQLDraft:
     q = question.strip()
     if not q:
@@ -73,6 +86,10 @@ def generate_rule_sql(question: str, db_path: Path) -> SQLDraft:
     elif "全职" in q:
         conditions.append("j.employment IN ('full_time', 'full_or_part_time')")
         rules.append("employment:full_time")
+
+    if "实习" in q:
+        conditions.append("(j.recruitment = 'internship' OR j.employment = 'internship')")
+        rules.append("internship")
 
     period = None
     if "月薪" in q:
@@ -110,7 +127,11 @@ def generate_rule_sql(question: str, db_path: Path) -> SQLDraft:
             parameters.append(f"%{match.group(1)}%")
             rules.append(column)
 
-    is_count = any(token in q for token in ("多少", "数量", "几条", "统计", "总数"))
+    is_count = is_count_question(q)
+    if is_count:
+        # Aggregate intent is a rule in its own right. A bare COUNT must never fall
+        # through to an external LLM merely because it has no WHERE conditions.
+        rules.append("aggregate:count")
     select = "SELECT COUNT(*) AS job_count" if is_count else (
         "SELECT j.job_id, j.title, j.company_name, j.city, j.education_min_level, "
         "j.experience_min_months, j.salary_min, j.salary_max, j.salary_currency, j.salary_period"
