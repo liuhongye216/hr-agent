@@ -7,15 +7,18 @@ from typing import Any, Protocol, TypedDict
 
 from pydantic import ValidationError
 
+from .clarification import ClarificationPolicy
 from .llm import LLMConfigurationError, LLMServiceError
 from .normalization import infer_atomic_mentions, normalize_patch
 from .patching import (
-    apply_draft_patch, changed_fields, sanitize_model_patch, unapplied_fields,
+    apply_draft_patch, changed_fields, requirement_modality_conflicts,
+    sanitize_model_patch, text_key, unapplied_fields,
 )
 from .repository import CsvJobRepository
 from .schemas import (
-    CREATE_CONTENT_FIELDS, FIELD_LABELS, JSON_FIELDS, REQUIRED_CREATE_FIELDS,
-    DraftPatch, JobFields, Phase, QueryPlan, StructuredCommand,
+    CREATE_CONTENT_FIELDS, CREATE_REQUIREMENT_FIELDS, FIELD_LABELS, JSON_FIELDS,
+    REQUIRED_CREATE_FIELDS, DraftPatch, JobFields, Phase, QueryPlan, StructuredCommand,
+    has_create_content, has_meaningful_value,
 )
 
 
@@ -46,6 +49,25 @@ class AgentState(TypedDict, total=False):
     requested_fields: list[str]
     source_messages: list[dict[str, str]]
     current_message_id: str | None
+    company_id: str
+    operator_id: str
+    roles: list[str]
+    target_profile_version: int | None
+    active_skills: list[str]
+    skill_instructions: str
+    clarification_count: int
+    clarification_history: list[dict[str, Any]]
+    clarification_answers: list[dict[str, Any]]
+    active_question: dict[str, Any] | None
+    clarification_budget_exhausted: bool
+    last_operation: str | None
+    last_job_id: str | None
+    last_job_snapshot: dict[str, Any] | None
+    last_profile_version: int | None
+    last_lifecycle_status: str | None
+    session_id: str | None
+    workflow_trace: list[str]
+    conversation_phase: str
 
 
 def initial_state() -> AgentState:
@@ -72,12 +94,32 @@ def initial_state() -> AgentState:
         "requested_fields": [],
         "source_messages": [],
         "current_message_id": None,
+        "company_id": "company_demo",
+        "operator_id": "operator_demo",
+        "roles": ["recruiter", "hr_admin"],
+        "target_profile_version": None,
+        "active_skills": [],
+        "skill_instructions": "",
+        "clarification_count": 0,
+        "clarification_history": [],
+        "clarification_answers": [],
+        "active_question": None,
+        "clarification_budget_exhausted": False,
+        "last_operation": None,
+        "last_job_id": None,
+        "last_job_snapshot": None,
+        "last_profile_version": None,
+        "last_lifecycle_status": None,
+        "session_id": None,
+        "workflow_trace": [],
+        "conversation_phase": "IDLE",
     }
 
 
-def _reset(message: str) -> AgentState:
+def _reset(message: str, **metadata: Any) -> AgentState:
     state = initial_state()
     state["message"] = message
+    state.update(metadata)
     return state
 
 
@@ -101,7 +143,7 @@ def _row_draft(row: dict[str, Any]) -> dict[str, Any]:
 
 def missing_create_fields(draft: dict[str, Any]) -> list[str]:
     missing = [field for field in REQUIRED_CREATE_FIELDS if not draft.get(field)]
-    if not any(draft.get(field) for field in CREATE_CONTENT_FIELDS):
+    if not has_create_content(draft):
         missing.append("job_content")
     return missing
 
@@ -130,10 +172,11 @@ def _display_value(field: str, value: Any) -> str:
 def render_preview(draft: dict[str, Any], provenance: dict[str, Any] | None = None) -> str:
     del provenance  # provenance is retained for audit, never exposed as internal JSON.
     scalar_order = (
-        "company_name", "title", "recruitment", "employment", "city", "work_address",
+        "company_name", "title", "department", "job_category", "headcount",
+        "recruitment", "recruitment_batch", "employment", "city", "work_address",
         "work_mode", "education_min_level", "experience_min_months", "experience_max_months",
         "internship_min_months", "onsite_days_per_week", "salary_min", "salary_max",
-        "salary_currency", "salary_period", "source_url",
+        "salary_currency", "salary_period", "application_deadline", "source_url",
     )
     lines = ["### 岗位草稿"]
     for field in scalar_order:
@@ -142,6 +185,7 @@ def render_preview(draft: dict[str, Any], provenance: dict[str, Any] | None = No
     for field in (
         "responsibilities_json", "requirements_json", "preferred_requirements_json",
         "not_required_requirements_json", "skills_json", "student_status_json",
+        "major_requirements_json", "graduation_years_json", "work_locations_json",
         "certificates_json", "benefits_json",
     ):
         values = _as_list(draft.get(field))
@@ -154,6 +198,7 @@ def render_preview(draft: dict[str, Any], provenance: dict[str, Any] | None = No
 
 def build_context(state: AgentState) -> dict[str, Any]:
     draft = deepcopy(state.get("draft", {}))
+    storage_valid = not missing_create_fields(draft) and not requirement_modality_conflicts(draft)
     return {
         "phase": state.get("phase", Phase.IDLE.value),
         "draft": draft,
@@ -161,8 +206,8 @@ def build_context(state: AgentState) -> dict[str, Any]:
         "last_assistant_question": state.get("last_assistant_question"),
         "pending_decision": deepcopy(state.get("pending_decision")),
         "recent_messages": deepcopy(state.get("recent_messages", [])),
-        "ready_to_save": not missing_create_fields(draft),
-        "storage_valid": not missing_create_fields(draft),
+        "ready_to_save": storage_valid,
+        "storage_valid": storage_valid,
         "extraction_complete": state.get("extraction_complete", True),
         "unresolved_fragments": deepcopy(state.get("unresolved_fragments", [])),
         "requested_fields": list(state.get("requested_fields", [])),
@@ -171,6 +216,10 @@ def build_context(state: AgentState) -> dict[str, Any]:
         "candidate_count": len(state.get("candidates", [])),
         "state_version": state.get("state_version", 0),
         "draft_revision": state.get("draft_revision", 0),
+        "active_skills": list(state.get("active_skills", [])),
+        "skill_instructions": state.get("skill_instructions", ""),
+        "clarification_count": state.get("clarification_count", 0),
+        "clarification_budget_exhausted": state.get("clarification_budget_exhausted", False),
     }
 
 
@@ -193,34 +242,55 @@ def _append_source_message(state: AgentState, user_text: str) -> None:
     state["source_messages"] = messages[-20:]
 
 
-_AFFIRMATIVE_RE = re.compile(
+_DECISION_AFFIRMATIVE_RE = re.compile(
     r"^(?:确认|确认了|我确认|确认写入|确定|是|是的|对|对的|可以|没错|好|好的|同意|保存吧)$"
 )
+_GENERIC_CONFIRM_RE = re.compile(r"^(?:确认|我确认)$")
+_SAVE_CONFIRM_RE = re.compile(r"^(?:确认保存|确认写入|按当前内容保存|保存当前内容|保存吧)$")
+_DELETE_CONFIRM_RE = re.compile(r"^(?:确认删除|删除吧)$")
 _NEGATIVE_RE = re.compile(r"^(?:不是|不对|否|不要|不同意|拒绝)$")
+_FINISH_EDITING_RE = re.compile(
+    r"^(?:不补充了|不用补充了|不再补充了|没有了|没有其他了|没了|就这些|就这样|以上这些)"
+    r"(?:吧)?[。.!！]?$"
+)
 
 
-def _update_summary(patch: DraftPatch, mentioned_fields: list[str]) -> str:
+def _update_summary(
+    before: dict[str, Any], after: dict[str, Any], mentioned_fields: list[str],
+) -> str:
     parts: list[str] = []
-    for field in dict.fromkeys(mentioned_fields):
-        if field in patch.set_fields:
-            parts.append(f"{FIELD_LABELS.get(field, field)}＝{_display_value(field, patch.set_fields[field])}")
-        elif field in JSON_FIELDS:
-            count = len(patch.append_items.get(field, []))
-            if count:
-                parts.append(f"{FIELD_LABELS.get(field, field)}新增{count}条")
+    changes = changed_fields(before, after)
+    ordered_fields = list(dict.fromkeys([*mentioned_fields, *sorted(changes)]))
+    for field in ordered_fields:
+        if field not in changes:
+            continue
+        if field in JSON_FIELDS:
+            before_keys = {text_key(value) for value in _as_list(before.get(field))}
+            after_values = _as_list(after.get(field))
+            added = [value for value in after_values if text_key(value) not in before_keys]
+            if added:
+                parts.append(f"{FIELD_LABELS.get(field, field)}新增{len(added)}条")
+            else:
+                parts.append(f"{FIELD_LABELS.get(field, field)}已更新")
+        elif field in after:
+            parts.append(f"{FIELD_LABELS.get(field, field)}＝{_display_value(field, after[field])}")
+        else:
+            parts.append(f"{FIELD_LABELS.get(field, field)}已清除")
     return "；".join(parts)
 
 
 def _render_query_detail(detail: dict[str, Any]) -> str:
     lines = ["### 岗位详情"]
     order = (
-        "job_id", "company_name", "title", "city", "work_address", "recruitment",
+        "job_id", "company_name", "title", "department", "job_category", "headcount",
+        "city", "work_address", "recruitment", "recruitment_batch",
         "employment", "work_mode", "education_min_level", "experience_min_months",
         "experience_max_months", "internship_min_months", "onsite_days_per_week",
         "salary_min", "salary_max", "salary_currency", "salary_period",
         "responsibilities_json", "requirements_json", "preferred_requirements_json",
         "not_required_requirements_json", "skills_json", "student_status_json",
-        "certificates_json", "benefits_json", "source_url",
+        "major_requirements_json", "graduation_years_json", "work_locations_json",
+        "certificates_json", "benefits_json", "application_deadline", "source_url",
     )
     for field in order:
         if field not in detail:
@@ -258,7 +328,127 @@ def _merge_patches(first: DraftPatch, second: DraftPatch) -> DraftPatch:
     return DraftPatch.model_validate(data)
 
 
-_REPAIR_RE = re.compile(r"(?:再|重新|仔细).*(?:看看|识别|提取)|(?:漏了|遗漏)|(?:学历|技能|经验|要求|职责)信息?呢")
+_REPAIR_RE = re.compile(
+    r"(?:再|重新|仔细).*(?:看看|识别|提取|检查|核对)|(?:漏了|遗漏)|"
+    r"(?:学历|技能|经验|要求|职责)信息?呢|(?:识别|提取).*(?:不准|不准确|错误|有误)|"
+    r"字段.*(?:不对|错误|有误)"
+)
+
+_UNRESOLVED_SCAFFOLD_RE = re.compile(
+    r"(?:新增|新建|创建|招聘|招募|招一名|招一个|一名|一个|岗位|职位|公司|"
+    r"要求|负责|想要|需要|现在要|现要|的|为|是|在)"
+)
+_ABSENT_INFO_REASON_RE = re.compile(
+    r"(?:用户)?(?:仅|只).*(?:提供|说明)|(?:尚未|未|没有)(?:明确)?提供|"
+    r"(?:尚未|未|没有)提及|"
+    r"缺少(?:岗位职责|任职要求|薪资|经验|学历|城市|地点|其他|关键)"
+)
+_REQUIREMENT_SEMANTIC_FIELDS = set(CREATE_REQUIREMENT_FIELDS)
+_AMBIGUITY_CLARIFICATION_RE = re.compile(
+    r"还是|硬性|加分|优先|属性|含义|歧义|不明确|不清楚|哪一种|具体指"
+)
+
+
+def _compact_fragment_text(value: str) -> str:
+    return re.sub(r"[\s，,。；;：:、.!！?？()（）\-—]+", "", value)
+
+
+def _fragment_is_fully_classified(fragment: Any, command: StructuredCommand) -> bool:
+    """Reject whole-message unresolved claims when every stated fact has evidence."""
+    source_message_id = fragment.source_message_id
+    evidence_texts = [
+        span.text
+        for span in command.evidence_spans
+        if span.source_message_id == source_message_id
+    ]
+    evidence_texts.extend(item.text for item in command.ignored_fragments)
+    if not evidence_texts:
+        return False
+    fragment_key = _compact_fragment_text(fragment.text)
+    if fragment_key and any(
+        fragment_key in _compact_fragment_text(value) for value in evidence_texts
+    ):
+        return True
+
+    residue = fragment.text
+    for value in sorted(set(evidence_texts), key=len, reverse=True):
+        residue = residue.replace(value, "")
+    residue = _UNRESOLVED_SCAFFOLD_RE.sub("", residue)
+    residue = re.sub(r"[\s，,。；;：:、.!！?？()（）\-—]+", "", residue)
+    return not residue
+
+
+def _fragment_is_source_grounded(
+    fragment: Any, semantic_text: str, source_messages: dict[str, str],
+) -> bool:
+    """Unresolved fragments must quote source text, never describe an absent field."""
+    if fragment.source_message_id:
+        source = source_messages.get(str(fragment.source_message_id), "")
+    else:
+        source = semantic_text
+    fragment_text = _compact_fragment_text(fragment.text)
+    return bool(fragment_text and fragment_text in _compact_fragment_text(source))
+
+
+def _unresolved_is_spurious(
+    fragment: Any, command: StructuredCommand, semantic_text: str,
+    source_messages: dict[str, str], touched: set[str],
+) -> bool:
+    """Drop only absence hallucinations or contradictions with an applied patch."""
+    suggested = set(fragment.suggested_fields)
+    clarification_targets = (
+        set(command.clarification_fields) if command.requires_clarification else set()
+    )
+    grounded = _fragment_is_source_grounded(fragment, semantic_text, source_messages)
+    fragment_context = f"{fragment.text} {fragment.reason}"
+    absence_claim = bool(
+        _ABSENT_INFO_REASON_RE.search(fragment_context)
+        and not _AMBIGUITY_CLARIFICATION_RE.search(fragment_context)
+    )
+
+    if not grounded:
+        return absence_claim and not (suggested & touched)
+    if absence_claim and not (suggested & touched):
+        return True
+    if suggested & clarification_targets or command.pending_decision is not None:
+        return False
+    if (
+        suggested and suggested <= touched
+        and _fragment_is_fully_classified(fragment, command)
+    ):
+        return True
+    return False
+
+
+def _previous_unresolved_is_resolved(
+    fragment: dict[str, Any], touched: set[str], patch: DraftPatch,
+    command: StructuredCommand,
+) -> bool:
+    related_fields = set(fragment.get("suggested_fields", [])) & touched
+    if not related_fields:
+        return False
+    if any(field not in JSON_FIELDS for field in related_fields):
+        return True
+
+    candidates: list[str] = []
+    for field in related_fields:
+        candidates.extend(item.value for item in patch.append_items.get(field, []))
+        candidates.extend(patch.remove_items.get(field, []))
+        candidates.extend(
+            value
+            for replacement in patch.replace_items
+            if replacement.field == field
+            for value in (replacement.match, replacement.value)
+        )
+        candidates.extend(
+            span.text for span in command.evidence_spans if span.field == field
+        )
+    fragment_key = text_key(str(fragment.get("text", "")))
+    return any(
+        (candidate_key := text_key(candidate))
+        and (candidate_key in fragment_key or fragment_key in candidate_key)
+        for candidate in candidates
+    )
 
 
 def _repair_fields(text: str) -> list[str]:
@@ -289,9 +479,13 @@ def _repair_sources(state: AgentState) -> list[dict[str, str]]:
 
 
 class JobCsvAgent:
-    def __init__(self, repository: CsvJobRepository, interpreter: Interpreter) -> None:
+    def __init__(
+        self, repository: CsvJobRepository, interpreter: Interpreter,
+        clarification_policy: ClarificationPolicy | None = None,
+    ) -> None:
         self.repository = repository
         self.interpreter = interpreter
+        self.clarification_policy = clarification_policy or ClarificationPolicy()
 
     def _finish(
         self, state: AgentState, user_text: str, message: str, *, question: str | None = None,
@@ -308,10 +502,11 @@ class JobCsvAgent:
     ) -> AgentState:
         draft = state.get("draft", {})
         missing = missing_create_fields(draft)
-        storage_valid = not missing
+        conflicts = requirement_modality_conflicts(draft)
+        storage_valid = not missing and not conflicts
         extraction_complete = state.get("extraction_complete", True)
         unresolved = state.get("unresolved_fragments", [])
-        if unresolved:
+        if unresolved or conflicts:
             extraction_complete = False
         state["storage_valid"] = storage_valid
         state["extraction_complete"] = extraction_complete
@@ -326,15 +521,55 @@ class JobCsvAgent:
         if missing or pending or not extraction_complete:
             state["phase"] = Phase.EDITING.value if state.get("pending_action") == "update" else Phase.CREATING.value
             state["can_confirm"] = False
-            if clarification:
-                question = clarification
+            state["conversation_phase"] = "WAITING_ANSWER"
+            requested = list(dict.fromkeys(clarification_fields or []))
+            if pending:
+                question = clarification or "请确认这项内容。"
+            elif conflicts:
+                items = "、".join(conflicts[:3])
+                question = (
+                    f"要求属性冲突：{items}。同一条件不能同时属于硬性要求、加分项或非必需条件，"
+                    "请说明每项的最终属性。"
+                )
+                requested = [
+                    "requirements_json", "preferred_requirements_json",
+                    "not_required_requirements_json",
+                ]
             elif unresolved:
                 fragments = "；".join(str(item.get("text", "")) for item in unresolved[:3])
                 question = f"还有信息尚未完整归类：{fragments}。请补充说明，或指出需要我重新识别的字段。"
+                requested = list(dict.fromkeys(
+                    field
+                    for item in unresolved
+                    for field in item.get("suggested_fields", [])
+                ))
+            elif missing:
+                required_targets = set(missing)
+                if "job_content" in required_targets:
+                    required_targets.remove("job_content")
+                    required_targets.update({"responsibilities_json", "requirements_json"})
+                relevant_clarification = bool(required_targets & set(requested))
+                includes_optional_targets = bool(set(requested) - required_targets)
+                if clarification and relevant_clarification and not includes_optional_targets:
+                    question = clarification
+                    requested = [field for field in requested if field in required_targets]
+                elif "job_content" in missing:
+                    question = "还缺少：任职要求或岗位职责。请至少补充一项；其他字段可以稍后补充。"
+                    requested = ["responsibilities_json", "requirements_json"]
+                else:
+                    labels = "、".join(FIELD_LABELS.get(field, field) for field in missing)
+                    question = f"还缺少：{labels}。请直接补充原文信息。"
+                    requested = list(missing)
+            elif clarification:
+                question = clarification
             else:
-                labels = "、".join(FIELD_LABELS.get(field, field) for field in missing)
-                question = f"还缺少：{labels}。请直接补充原文信息。"
-            state["requested_fields"] = list(dict.fromkeys(clarification_fields or missing))
+                question = "草稿抽取尚未完成，请补充说明需要调整的内容。"
+            state["requested_fields"] = requested
+            self.clarification_policy.record(
+                state, question, requested or ["job_content"],
+                reason=("conflict" if conflicts else "unresolved" if unresolved else "missing_or_ambiguous"),
+                blocking=True,
+            )
             status = ""
             if storage_valid and not extraction_complete:
                 status = "\n\n草稿已具备最低保存条件，但抽取尚未完整。"
@@ -342,6 +577,7 @@ class JobCsvAgent:
                 state, text, f"{prefix}{preview}{status}\n\n{question}", question=question,
             )
         state["phase"] = Phase.CONFIRMING.value
+        state["conversation_phase"] = "WAITING_CONFIRMATION"
         state["can_confirm"] = True
         state["requested_fields"] = []
         return self._finish(
@@ -350,15 +586,31 @@ class JobCsvAgent:
         )
 
     def _show_current(self, state: AgentState, text: str) -> AgentState:
-        missing = missing_create_fields(state.get("draft", {}))
+        draft = state.get("draft", {})
+        missing = missing_create_fields(draft)
+        conflicts = requirement_modality_conflicts(draft)
         state["missing_fields"] = missing
+        state["storage_valid"] = not missing and not conflicts
+        state["preview_revision"] = state.get("draft_revision", 0)
         state["can_confirm"] = (
-            not missing and not state.get("pending_decision")
+            not missing and not conflicts and not state.get("pending_decision")
             and state.get("extraction_complete", True)
             and state.get("pending_action") in {"create", "update"}
             and state.get("preview_revision") == state.get("draft_revision")
         )
-        return self._finish(state, text, "当前完整草稿：\n" + render_preview(state.get("draft", {})))
+        reason = ""
+        if conflicts:
+            reason = f"\n\n当前不能保存：要求属性冲突（{'、'.join(conflicts[:3])}）。"
+        elif "job_content" in missing:
+            state["requested_fields"] = ["responsibilities_json", "requirements_json"]
+            reason = "\n\n当前不能保存：还缺少任职要求或岗位职责，请至少补充一项。"
+        elif missing:
+            state["requested_fields"] = list(missing)
+            labels = "、".join(FIELD_LABELS.get(field, field) for field in missing)
+            reason = f"\n\n当前不能保存：还缺少{labels}。"
+        elif not state.get("extraction_complete", True):
+            reason = "\n\n当前不能保存：仍有信息尚未完整归类，请先完成纠正。"
+        return self._finish(state, text, "当前完整草稿：\n" + render_preview(draft) + reason)
 
     def _select(self, state: AgentState, index: int, text: str) -> AgentState:
         candidates = state.get("candidates", [])
@@ -366,6 +618,9 @@ class JobCsvAgent:
             return self._finish(state, text, "选择序号超出范围，请重新选择。")
         row = candidates[index - 1]
         state["target_id"] = row["job_id"]
+        state["target_profile_version"] = (
+            int(row["profile_version"]) if row.get("profile_version") not in (None, "") else None
+        )
         state["candidates"] = []
         if state.get("pending_action") == "delete":
             state["phase"] = Phase.CONFIRMING.value
@@ -378,6 +633,7 @@ class JobCsvAgent:
         state["draft_revision"] = state.get("draft_revision", 0) + 1
         state["preview_revision"] = None
         state["phase"] = Phase.EDITING.value
+        state["conversation_phase"] = "COLLECTING"
         state["can_confirm"] = False
         state["can_cancel"] = True
         return self._finish(state, text, "已选择岗位，请说明要修改的字段或原文条目。")
@@ -398,6 +654,8 @@ class JobCsvAgent:
         return self._finish(state, text, f"找到多个岗位，请选择：\n{options}")
 
     def _confirm(self, state: AgentState, text: str) -> AgentState:
+        if requirement_modality_conflicts(state.get("draft", {})):
+            return self._draft_response(state, text)
         if not state.get("can_confirm"):
             return self._finish(state, text, "当前没有等待确认的写入操作。")
         if state.get("preview_revision") != state.get("draft_revision"):
@@ -420,7 +678,20 @@ class JobCsvAgent:
             message = f"已删除岗位：{row.get('company_name')} - {row.get('title')}。"
         else:
             return self._finish(state, text, "当前没有可执行的确认操作。")
-        return _reset(message)
+        return _reset(
+            message,
+            company_id=state.get("company_id", "company_demo"),
+            operator_id=state.get("operator_id", "operator_demo"),
+            roles=list(state.get("roles", ["recruiter", "hr_admin"])),
+            last_operation=action,
+            last_job_id=row.get("job_id"),
+            last_job_snapshot=dict(row),
+            last_profile_version=(
+                int(row["profile_version"]) if row.get("profile_version") not in (None, "") else None
+            ),
+            last_lifecycle_status=row.get("lifecycle_status"),
+            conversation_phase="COMPLETED",
+        )
 
     def _query(self, state: AgentState, text: str, plan: QueryPlan) -> AgentState:
         filters = plan.filters()
@@ -456,7 +727,9 @@ class JobCsvAgent:
         source_message_id: str | None = None,
     ) -> tuple[DraftPatch, dict[str, Any], dict[str, Any], list[str]]:
         inferred = infer_atomic_mentions(text, source_message_id)
-        patch = normalize_patch(command.patch, text, [*command.mentions, *inferred])
+        patch = normalize_patch(
+            command.patch, text, [*command.mentions, *inferred], current_draft=before_draft,
+        )
         if allowed_fields is not None:
             patch = _patch_for_fields(patch, allowed_fields)
         declared = mentioned_fields if mentioned_fields is not None else command.mentioned_fields
@@ -540,38 +813,58 @@ class JobCsvAgent:
             if forced_command.get("intent") == "confirm":
                 return self._confirm(current, text)
             if forced_command.get("intent") == "cancel":
-                return _reset("已取消当前操作，未写入任何数据。")
+                return _reset("已取消当前操作，未写入任何数据。", conversation_phase="CANCELLED")
             if forced_command.get("selection_index") is not None:
                 return self._select(current, int(forced_command["selection_index"]), text)
 
-        if _AFFIRMATIVE_RE.fullmatch(text):
-            pending = current.get("pending_decision")
-            if pending:
-                patch = DraftPatch.model_validate(pending["patch"])
-                before = deepcopy(current.get("draft", {}))
-                draft, provenance = apply_draft_patch(
-                    before, current.get("provenance", {}), patch,
+        pending = current.get("pending_decision")
+        if pending and _DECISION_AFFIRMATIVE_RE.fullmatch(text):
+            patch = DraftPatch.model_validate(pending["patch"])
+            before = deepcopy(current.get("draft", {}))
+            draft, provenance = apply_draft_patch(
+                before, current.get("provenance", {}), patch,
+            )
+            current["draft"] = draft
+            current["provenance"] = provenance
+            if changed_fields(before, draft):
+                current["draft_revision"] = current.get("draft_revision", 0) + 1
+            mentioned = list(pending.get("mentioned_fields", []))
+            current["pending_decision"] = None
+            current["preview_revision"] = None
+            return self._draft_response(
+                current, text, update_summary=_update_summary(before, draft, mentioned),
+            )
+        if _GENERIC_CONFIRM_RE.fullmatch(text):
+            return self._confirm(current, text)
+        if _SAVE_CONFIRM_RE.fullmatch(text):
+            if current.get("pending_action") == "delete":
+                return self._finish(
+                    current, text, "确认指令与当前操作不匹配：当前是删除操作，请明确输入“确认删除”。",
                 )
-                current["draft"] = draft
-                current["provenance"] = provenance
-                if changed_fields(before, draft):
-                    current["draft_revision"] = current.get("draft_revision", 0) + 1
-                mentioned = list(pending.get("mentioned_fields", []))
-                current["pending_decision"] = None
-                current["preview_revision"] = None
-                return self._draft_response(
-                    current, text, update_summary=_update_summary(patch, mentioned),
+            return self._confirm(current, text)
+        if _DELETE_CONFIRM_RE.fullmatch(text):
+            if current.get("pending_action") != "delete":
+                return self._finish(
+                    current, text, "确认指令与当前操作不匹配：当前不是删除操作，未执行任何写入。",
                 )
             return self._confirm(current, text)
         if _NEGATIVE_RE.fullmatch(text) and current.get("pending_decision"):
             current["pending_decision"] = None
             return self._draft_response(current, text)
         if text in {"取消", "取消操作", "算了"}:
-            return _reset("已取消当前操作，未写入任何数据。")
-        if re.search(r"(?:现在|当前).*(?:字段|草稿)|字段是什么", text):
+            return _reset("已取消当前操作，未写入任何数据。", conversation_phase="CANCELLED")
+        if _FINISH_EDITING_RE.fullmatch(text):
+            if current.get("pending_action") in {"create", "update"}:
+                return self._draft_response(current, text)
+            return self._finish(current, text, "当前没有正在编辑的岗位草稿。")
+        if current.get("active_question"):
+            self.clarification_policy.answer_current(
+                current, text, current.get("current_message_id"),
+            )
+        repair_requested = bool(_REPAIR_RE.search(text))
+        if not repair_requested and re.search(r"(?:现在|当前).*(?:字段|草稿)|字段是什么", text):
             return self._show_current(current, text)
 
-        repair_requested = bool(_REPAIR_RE.search(text))
         repair_sources = _repair_sources(current) if repair_requested else []
         semantic_text = "\n".join(item["content"] for item in repair_sources) if repair_sources else text
         source_messages = {
@@ -587,17 +880,57 @@ class JobCsvAgent:
                 "source_message_ids": [item["id"] for item in repair_sources],
                 "instruction": "重新分析这些历史用户原文；evidence_spans 使用对应 source_message_id。",
             }
+        deterministic_mentions = infer_atomic_mentions(
+            text, current.get("current_message_id"),
+        )
         try:
             command = self.interpreter.extract(text, context)
         except (LLMConfigurationError, LLMServiceError) as exc:
-            return self._finish(current, text, str(exc))
+            if current.get("pending_action") not in {"create", "update"} or not deterministic_mentions:
+                return self._finish(current, text, str(exc))
+            command = StructuredCommand(
+                intent="update",
+                task_relation="continue_current",
+                mentions=deterministic_mentions,
+                mentioned_fields=list(dict.fromkeys(
+                    mention.field for mention in deterministic_mentions
+                )),
+            )
         except ValidationError as exc:
-            return self._finish(current, text, f"模型返回的结构化结果无效，草稿已保留：{exc}")
+            if current.get("pending_action") not in {"create", "update"} or not deterministic_mentions:
+                return self._finish(current, text, f"模型返回的结构化结果无效，草稿已保留：{exc}")
+            command = StructuredCommand(
+                intent="update",
+                task_relation="continue_current",
+                mentions=deterministic_mentions,
+                mentioned_fields=list(dict.fromkeys(
+                    mention.field for mention in deterministic_mentions
+                )),
+            )
+
+        if (
+            current.get("pending_action") in {"create", "update"}
+            and deterministic_mentions
+            and command.intent in {"confirm", "cancel", "help", "conversation", "unsupported", "unknown"}
+        ):
+            command = command.model_copy(update={
+                "intent": "update",
+                "task_relation": "continue_current",
+                "mentions": [*command.mentions, *deterministic_mentions],
+                "mentioned_fields": list(dict.fromkeys([
+                    *command.mentioned_fields,
+                    *(mention.field for mention in deterministic_mentions),
+                ])),
+            })
 
         if command.intent == "confirm":
-            return self._confirm(current, text)
+            return self._finish(
+                current,
+                text,
+                "未执行保存。普通消息不会触发写入；请使用“按当前内容保存”按钮，或明确输入“确认保存”。",
+            )
         if command.intent == "cancel":
-            return _reset("已取消当前操作，未写入任何数据。")
+            return _reset("已取消当前操作，未写入任何数据。", conversation_phase="CANCELLED")
         if command.intent in {"search", "count", "detail"}:
             mode = {"count": "count", "detail": "detail"}.get(command.intent, "list")
             plan = command.query_plan or QueryPlan(mode=mode)
@@ -632,12 +965,14 @@ class JobCsvAgent:
                 current = initial_state()
             current["pending_action"] = "create"
             current["phase"] = Phase.CREATING.value
+            current["conversation_phase"] = "COLLECTING"
         elif command.intent != "update" or current.get("pending_action") not in {"create", "update"}:
             return self._finish(current, text, "请说明要新增、修改或查询的岗位。")
 
         current["pending_decision"] = None
         requested_before = set(current.get("requested_fields", []))
         previous_unresolved = list(current.get("unresolved_fragments", []))
+        draft_before_round = deepcopy(current.get("draft", {}))
         current, used_command, patch, failures = self._apply_with_retry(
             current, command, semantic_text, source_messages,
         )
@@ -645,7 +980,13 @@ class JobCsvAgent:
             set(patch.set_fields) | set(patch.append_items) | set(patch.remove_items)
             | set(patch.clear_fields) | {item.field for item in patch.replace_items}
         )
-        unresolved = [item.model_dump(mode="json") for item in used_command.unresolved_fragments]
+        unresolved = [
+            item.model_dump(mode="json")
+            for item in used_command.unresolved_fragments
+            if not _unresolved_is_spurious(
+                item, used_command, semantic_text, source_messages, touched,
+            )
+        ]
         unresolved.extend({
             "text": f"字段“{FIELD_LABELS.get(field, field)}”未能应用",
             "reason": "本轮结构化结果没有产生可验证的字段更新",
@@ -655,7 +996,9 @@ class JobCsvAgent:
         if not repair_requested:
             unresolved = [
                 item for item in previous_unresolved
-                if not (set(item.get("suggested_fields", [])) & touched)
+                if not _previous_unresolved_is_resolved(
+                    item, touched, patch, used_command,
+                )
             ] + unresolved
         deduplicated: list[dict[str, Any]] = []
         seen_unresolved: set[tuple[str, str]] = set()
@@ -666,9 +1009,12 @@ class JobCsvAgent:
                 deduplicated.append(item)
         unresolved = deduplicated
         current["unresolved_fragments"] = unresolved
-        current["extraction_complete"] = used_command.extraction_complete and not unresolved
         if used_command.pending_decision is not None:
-            decision_patch = normalize_patch(used_command.pending_decision.patch, text)
+            decision_patch = normalize_patch(
+                used_command.pending_decision.patch,
+                text,
+                current_draft=current.get("draft", {}),
+            )
             decision_patch = sanitize_model_patch(
                 decision_patch, semantic_text, used_command.mentioned_fields,
                 used_command.evidence_spans, used_command.ignored_fragments,
@@ -686,7 +1032,45 @@ class JobCsvAgent:
                 }
         clarification = used_command.clarification_question if used_command.requires_clarification else None
         clarification_fields = used_command.clarification_fields
+        clarification_targets = set(clarification_fields)
         remaining_missing = set(missing_create_fields(current.get("draft", {})))
+        useful_clarification_targets = set(remaining_missing)
+        if "job_content" in useful_clarification_targets:
+            useful_clarification_targets.remove("job_content")
+            useful_clarification_targets.update({"responsibilities_json", "requirements_json"})
+        clarification_relevant = bool(
+            used_command.requires_clarification
+            and (
+                clarification_targets
+                & (touched | {span.field for span in used_command.evidence_spans})
+                or (
+                    _AMBIGUITY_CLARIFICATION_RE.search(clarification or "")
+                    and (
+                        any(
+                            has_meaningful_value(current.get("draft", {}).get(field))
+                            for field in clarification_targets
+                        )
+                        or (
+                            clarification_targets & _REQUIREMENT_SEMANTIC_FIELDS
+                            and any(
+                                has_meaningful_value(current.get("draft", {}).get(field))
+                                for field in _REQUIREMENT_SEMANTIC_FIELDS
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        clarification_useful = bool(
+            used_command.requires_clarification
+            and clarification_targets & useful_clarification_targets
+        )
+        if not (clarification_relevant or clarification_useful):
+            clarification = None
+            clarification_fields = []
+        current["extraction_complete"] = not (
+            unresolved or current.get("pending_decision") or clarification_relevant
+        )
         remaining_requested = {
             field for field in requested_before
             if field in remaining_missing or (
@@ -700,7 +1084,9 @@ class JobCsvAgent:
         return self._draft_response(
             current, text, clarification,
             update_summary=_update_summary(
-                patch, list(dict.fromkeys([*command.mentioned_fields, *sorted(touched)])),
+                draft_before_round,
+                current.get("draft", {}),
+                list(dict.fromkeys([*command.mentioned_fields, *sorted(touched)])),
             ),
             clarification_fields=clarification_fields,
         )

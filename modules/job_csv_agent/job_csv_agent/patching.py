@@ -7,8 +7,16 @@ from copy import deepcopy
 from difflib import SequenceMatcher
 from typing import Any, Iterable
 
-from .normalization import clean_markdown, closed_field_values
+from .normalization import (
+    clean_markdown, closed_field_values, experience_ranges_equivalent_for_reclassification,
+    parse_experience_range,
+)
 from .schemas import DraftPatch, EvidenceSpan, IgnoredFragment, JSON_FIELDS, JobFields, PatchItem
+
+
+REQUIREMENT_MODALITY_FIELDS = (
+    "requirements_json", "preferred_requirements_json", "not_required_requirements_json",
+)
 
 
 def text_key(value: str) -> str:
@@ -37,15 +45,65 @@ def normalize_job_fields(fields: dict[str, Any]) -> dict[str, Any]:
             if key and key not in seen:
                 seen.add(key)
                 values.append(value)
-        candidate[field] = values
+        if values:
+            candidate[field] = values
+        else:
+            candidate.pop(field, None)
     return JobFields.model_validate(candidate).model_dump(exclude_none=True)
+
+
+def requirement_modality_conflicts(fields: dict[str, Any]) -> list[str]:
+    """Return conditions present in more than one mutually exclusive modality list."""
+    seen: list[tuple[str, str]] = []
+    conflicts: list[str] = []
+    for field in REQUIREMENT_MODALITY_FIELDS:
+        for value in _as_list(fields.get(field, [])):
+            previous_fields = {seen_field for seen_field, item in seen if _matches(value, item)}
+            if previous_fields and field not in previous_fields and not any(
+                _matches(value, item) for item in conflicts
+            ):
+                conflicts.append(value)
+            seen.append((field, value))
+    hard_experience = (
+        fields.get("experience_min_months"), fields.get("experience_max_months"),
+    )
+    hard_requirements = _as_list(fields.get("requirements_json", []))
+    if any(value is not None for value in hard_experience):
+        for field in ("preferred_requirements_json", "not_required_requirements_json"):
+            for value in _as_list(fields.get(field, [])):
+                same_hard_fact = not hard_requirements or any(
+                    _matches(value, requirement) for requirement in hard_requirements
+                )
+                if (
+                    (value_range := parse_experience_range(value)) is not None
+                    and experience_ranges_equivalent_for_reclassification(
+                        value_range, hard_experience,
+                    )
+                    and same_hard_fact
+                    and not any(_matches(value, item) for item in conflicts)
+                ):
+                    conflicts.append(value)
+    return conflicts
 
 
 def _matches(value: str, target: str) -> bool:
     left, right = text_key(value), text_key(target)
     if not left or not right:
         return False
-    return left == right or SequenceMatcher(None, left, right).ratio() >= 0.9
+    if left == right:
+        return True
+    if "经验" in left and "经验" in right:
+        left_range = parse_experience_range(value)
+        right_range = parse_experience_range(target)
+        number = r"(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十]+)"
+        left_subject = re.sub(rf"{number}年(?:以上|及以上|以下|以内|起)?", "", left)
+        right_subject = re.sub(rf"{number}年(?:以上|及以上|以下|以内|起)?", "", right)
+        qualifier = r"^(?:(?:要求|必须|需要|需|具备)?(?:至少|最低|不少于|不低于))"
+        left_subject = re.sub(qualifier, "", left_subject)
+        right_subject = re.sub(qualifier, "", right_subject)
+        if left_range is not None or right_range is not None:
+            return left_range == right_range and left_subject == right_subject
+    return SequenceMatcher(None, left, right).ratio() >= 0.9
 
 
 def _item_sources(provenance: dict[str, Any], field: str, values: list[str]) -> list[dict[str, str]]:
@@ -111,11 +169,68 @@ def apply_draft_patch(
             next_draft[replacement.field] = values
             next_provenance[replacement.field] = sources
 
+    # A newly assigned modality is authoritative for that item. Remove stale
+    # copies from the other mutually exclusive requirement lists atomically.
+    for field, items in patch.append_items.items():
+        if field not in REQUIREMENT_MODALITY_FIELDS:
+            continue
+        targets = [item.value for item in items]
+        original_experience = (
+            draft.get("experience_min_months"), draft.get("experience_max_months"),
+        )
+        hard_experience = original_experience if any(
+            value is not None for value in original_experience
+        ) else (
+            next_draft.get("experience_min_months"),
+            next_draft.get("experience_max_months"),
+        )
+        hard_requirements = _as_list(draft.get("requirements_json", []))
+        experience_hard_requirements = [
+            requirement for requirement in hard_requirements
+            if parse_experience_range(requirement) is not None
+        ]
+        reclassified_experience = any(
+            (target_range := parse_experience_range(target)) is not None
+            and experience_ranges_equivalent_for_reclassification(
+                target_range, hard_experience,
+            )
+            and (
+                not experience_hard_requirements
+                or any(
+                    _matches(target, requirement)
+                    for requirement in experience_hard_requirements
+                )
+            )
+            for target in targets
+        )
+        if (
+            field in {"preferred_requirements_json", "not_required_requirements_json"}
+            and reclassified_experience
+        ):
+            for scalar_field in ("experience_min_months", "experience_max_months"):
+                next_draft.pop(scalar_field, None)
+                next_provenance.pop(scalar_field, None)
+        for other_field in REQUIREMENT_MODALITY_FIELDS:
+            if other_field == field:
+                continue
+            values = _as_list(next_draft.get(other_field, []))
+            sources = _item_sources(next_provenance, other_field, values)
+            keep = [
+                index for index, value in enumerate(values)
+                if not any(_matches(value, target) for target in targets)
+            ]
+            next_draft[other_field] = [values[index] for index in keep]
+            next_provenance[other_field] = [sources[index] for index in keep]
+
     for field, items in patch.append_items.items():
         for item in items:
             _append_item(next_draft, next_provenance, field, item)
 
-    return normalize_job_fields(next_draft), next_provenance
+    normalized = normalize_job_fields(next_draft)
+    for field in JSON_FIELDS:
+        if field not in normalized:
+            next_provenance.pop(field, None)
+    return normalized, next_provenance
 
 
 def changed_fields(before: dict[str, Any], after: dict[str, Any]) -> set[str]:

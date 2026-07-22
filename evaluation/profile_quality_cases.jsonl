@@ -1,0 +1,4 @@
+{"case_id":"complete","profile":{"company_id":"eval_company","company_name":"甲公司","title":"算法工程师","responsibilities":["负责模型训练"]},"expected_status":"pass"}
+{"case_id":"missing_title","profile":{"company_id":"eval_company","company_name":"甲公司","responsibilities":["负责模型训练"]},"expected_status":"needs_clarification"}
+{"case_id":"modality_conflict","profile":{"company_id":"eval_company","company_name":"甲公司","title":"算法工程师","responsibilities":["负责模型训练"],"requirements":["熟悉Python"],"preferred_requirements":["熟悉Python"]},"expected_status":"conflict"}
+{"case_id":"sensitive_warning","profile":{"company_id":"eval_company","company_name":"甲公司","title":"行政专员","responsibilities":["负责行政事务"],"requirements":["仅限女性"]},"expected_status":"pass","expected_issue":"sensitive_employment_condition"}

@@ -39,6 +39,62 @@ def chinese_number(value: str) -> float | None:
 
 
 _NUMBER = r"(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十]+)"
+_REQUIREMENT_MODALITY_FIELDS = {
+    "required": "requirements_json",
+    "preferred": "preferred_requirements_json",
+    "not_required": "not_required_requirements_json",
+}
+_PREFERRED_SIGNAL_RE = re.compile(
+    r"(?:只是|仅是)?(?:加分项|优先项|优选条件)|非硬性要求|"
+    r"(?:有|具备).+者优先|(?:经验|年限)(?:者)?优先|优先考虑"
+)
+_NOT_REQUIRED_SIGNAL_RE = re.compile(r"不要求|无需|没有.+也可以")
+_CORRECTION_SIGNAL_RE = re.compile(
+    r"刚才|之前|前面|改成|改为|只是|仅是|不是硬性|非硬性|不要求|无需"
+)
+
+
+def _canonical_requirement_text(value: str) -> str:
+    """Strip conversational correction framing while preserving the stated fact."""
+    text = clean_markdown(value).strip("，,。；;：: ")
+    text = re.sub(
+        r"^(?:[（(【\[]\s*)?"
+        r"(?:加分项|优先项|优选条件|非硬性要求|非必需条件|硬性要求)"
+        r"(?:\s*[）)】\]])?\s*(?:[：:\-—]\s*)?",
+        "",
+        text,
+    ).strip()
+    text = re.sub(
+        r"^(?:我)?(?:刚才|之前|前面)(?:我)?"
+        r"(?:说的是|说的|说了|提到的是|提到的|提到|表达的是|表达的|表达了|改成|改为)"
+        r"(?:是)?",
+        "",
+        text,
+    ).strip()
+    text = re.sub(
+        r"(?:只是|仅是)?(?:加分项|优先项|优选条件|非硬性要求)$",
+        "",
+        text,
+    ).strip("，,。；;：: ")
+    return text
+
+
+def _canonical_responsibility_text(value: str) -> str:
+    text = clean_markdown(value).strip("，,。；;：: ")
+    return re.sub(r"^(?:主要)?负责", "", text).strip() or text
+
+
+_EXPERIENCE_EXPRESSION_RE = re.compile(
+    rf"{_NUMBER}(?:(?:到|至|[-~～—–]){_NUMBER})?年(?:以上|及以上|以下|以内|起)?"
+    r"[^，,。；;！？]{0,10}(?:经验|年限)"
+)
+
+
+def _experience_context_is_non_required(source: str, expression: re.Match[str]) -> bool:
+    prefix = re.split(r"[，,。；;！？]", source[:expression.start()])[-1][-10:]
+    suffix = re.split(r"[，,。；;！？]", source[expression.end():], maxsplit=1)[0][:12]
+    window = prefix + expression.group(0) + suffix
+    return bool(_PREFERRED_SIGNAL_RE.search(window) or _NOT_REQUIRED_SIGNAL_RE.search(window))
 
 
 def parse_experience_months(text: str) -> int | None:
@@ -92,6 +148,68 @@ def parse_experience_range(text: str) -> tuple[int | None, int | None] | None:
     return (months, None) if months is not None else None
 
 
+def parse_required_experience_range(text: str) -> tuple[int | None, int | None] | None:
+    """Select the first hard experience expression without being fooled by preferred clauses."""
+    source = clean_markdown(text)
+    expressions = list(_EXPERIENCE_EXPRESSION_RE.finditer(source))
+    for expression in expressions:
+        if _experience_context_is_non_required(source, expression):
+            continue
+        parsed = parse_experience_range(expression.group(0))
+        if parsed is not None:
+            return parsed
+    if not expressions:
+        parsed = parse_experience_range(source)
+        if parsed == (0, None):
+            return parsed
+        if (
+            parsed is not None
+            and not _PREFERRED_SIGNAL_RE.search(source)
+            and not _NOT_REQUIRED_SIGNAL_RE.search(source)
+        ):
+            return parsed
+    return None
+
+
+def has_experience_context(text: str) -> bool:
+    return re.search(
+        r"经验|(?:工作|从业|任职|相关|专业|开发|产品)年限", clean_markdown(text),
+    ) is not None
+
+
+def experience_ranges_equivalent_for_reclassification(
+    left: tuple[int | None, int | None],
+    right: tuple[int | None, int | None],
+) -> bool:
+    """Treat a model-generated equal upper bound as the same minimum-only fact."""
+    if left == right:
+        return True
+    if left[0] is None or right[0] is None or left[0] != right[0]:
+        return False
+    return left[1] in {None, left[0]} and right[1] in {None, right[0]}
+
+
+def _experience_subject(value: str) -> str:
+    compact = clean_markdown(value).replace(" ", "")
+    compact = re.sub(
+        rf"{_NUMBER}年(?:以上|及以上|以下|以内|起)?", "", compact,
+    )
+    return re.sub(
+        r"^(?:要求|必须|需要|需|具备)?(?:至少|最低|不少于|不低于)?", "", compact,
+    )
+
+
+def _same_experience_requirement(left: str, right: str) -> bool:
+    left_range = parse_experience_range(left)
+    right_range = parse_experience_range(right)
+    return bool(
+        left_range is not None
+        and right_range is not None
+        and experience_ranges_equivalent_for_reclassification(left_range, right_range)
+        and _experience_subject(left) == _experience_subject(right)
+    )
+
+
 def parse_recruitment(text: str) -> str | None:
     if re.search(r"社会招聘|社招", text):
         return "experienced"
@@ -111,6 +229,13 @@ def parse_education_level(text: str) -> int | None:
         return 4
     if re.search(r"本科(?:生)?(?:或|和|及)研究生在读", text):
         return 4
+    compact = clean_markdown(text).replace(" ", "")
+    for label, level in (("博士", 6), ("硕士", 5), ("本科", 4)):
+        if re.search(
+            rf"(?:最低)?学历(?:要求)?(?:为|是|需|要求|：|:)?{label}(?:学历)?",
+            compact,
+        ):
+            return level
     return None
 
 
@@ -166,6 +291,8 @@ def _section_items(text: str, label: str) -> list[str]:
 def infer_atomic_mentions(text: str, source_message_id: str | None = None) -> list[AtomicMention]:
     """Deterministic high-precision mentions for common JD constructions."""
     source = clean_markdown(text)
+    if re.search(r"[?？]|还是|是否|(?:吗|么|呢)(?:[。.!！?？]|$)", source):
+        return []
     mentions: list[AtomicMention] = []
 
     def add(**data: Any) -> None:
@@ -211,6 +338,17 @@ def infer_atomic_mentions(text: str, source_message_id: str | None = None) -> li
                 operation="append", source="explicit",
             )
 
+    for match in re.finditer(
+        r"(?:^|[，,。；;])\s*(?P<item>负责[^，,。；;！？]+)",
+        source,
+    ):
+        item = match.group("item").strip()
+        if item:
+            add(
+                field="responsibilities_json", raw_text=item, items=[item],
+                operation="append", source="explicit",
+            )
+
     # Numbered full JDs are already explicitly sectioned and are handled by the
     # model without flattening their boundaries. This fallback targets prose JDs.
     if not ("岗位职责" in source and "任职要求" in source):
@@ -230,14 +368,20 @@ def infer_atomic_mentions(text: str, source_message_id: str | None = None) -> li
     modality_patterns = (
         ("not_required", r"不要求(?P<item>[^，,。；;]+)"),
         ("not_required", r"没有(?P<item>[^，,。；;]+?)也可以"),
-        ("preferred", r"(?P<item>[^，,。；;]+?)(?:只是|仅是)?(?:加分项|优先项)"),
+        (
+            "preferred",
+            r"(?P<item>[^，,。；;]+?)(?:只是|仅是)?"
+            r"(?:加分项|优先项|优选条件|非硬性要求|优先(?:考虑)?)",
+        ),
         ("required", r"(?:但)?必须(?:能够)?(?P<item>[^，,。；;]+)"),
     )
     for modality, pattern in modality_patterns:
         for match in re.finditer(pattern, source):
             item = re.sub(r"^(?:但|而)", "", match.group("item")).strip("，,。；; ")
             if modality == "preferred":
-                item = re.sub(r"(?:只是|仅是)$", "", item).strip()
+                item = _canonical_requirement_text(item)
+                if match.group(0).endswith("优先"):
+                    item = re.sub(r"者$", "", item).strip()
             if modality == "required":
                 item = re.sub(r"^能够", "", item).strip()
             if item:
@@ -257,8 +401,8 @@ def closed_field_values(text: str) -> dict[str, Any]:
     education = parse_education_level(text)
     if education is not None:
         result["education_min_level"] = education
-    if re.search(r"经验|年限|最低经验", text):
-        experience = parse_experience_range(text)
+    if has_experience_context(text):
+        experience = parse_required_experience_range(text)
         if experience is not None:
             minimum, maximum = experience
             if minimum is not None:
@@ -279,17 +423,15 @@ def _merge_mentions(data: dict[str, Any], mentions: list[AtomicMention]) -> None
     set_sources = data.setdefault("set_sources", {})
     append_items = data.setdefault("append_items", {})
     remove_items = data.setdefault("remove_items", {})
-    modality_fields = {
-        "required": "requirements_json",
-        "preferred": "preferred_requirements_json",
-        "not_required": "not_required_requirements_json",
-    }
     for mention in mentions:
         field = mention.field
         if field == "requirements_json":
-            field = modality_fields[mention.modality]
+            field = _REQUIREMENT_MODALITY_FIELDS[mention.modality]
         if field in JSON_FIELDS:
             values = mention.items or ([] if mention.value is None else [str(mention.value)])
+            if field in _REQUIREMENT_MODALITY_FIELDS.values():
+                values = [_canonical_requirement_text(value) for value in values]
+                values = [value for value in values if value]
             target = remove_items if mention.operation == "remove" else append_items
             if mention.operation == "remove":
                 target.setdefault(field, []).extend(values)
@@ -297,9 +439,110 @@ def _merge_mentions(data: dict[str, Any], mentions: list[AtomicMention]) -> None
                 target.setdefault(field, []).extend(
                     PatchItem(value=value, source=mention.source).model_dump() for value in values
                 )
+        elif mention.operation == "remove":
+            clear_fields = data.setdefault("clear_fields", [])
+            clear_fields.append(field)
         elif mention.value is not None and mention.operation == "set":
             set_fields[field] = mention.value
             set_sources[field] = mention.source
+
+
+def _normalize_requirement_patch_items(data: dict[str, Any]) -> None:
+    for section in ("append_items", "remove_items"):
+        for field in _REQUIREMENT_MODALITY_FIELDS.values():
+            values = data.get(section, {}).get(field)
+            if not values:
+                continue
+            if section == "append_items":
+                normalized = []
+                for item in values:
+                    value = _canonical_requirement_text(item["value"])
+                    if value:
+                        normalized.append({**item, "value": value})
+            else:
+                normalized = [
+                    value
+                    for item in values
+                    if (value := _canonical_requirement_text(str(item)))
+                ]
+            data[section][field] = normalized
+
+
+def _apply_requirement_modality_migrations(
+    data: dict[str, Any], mentions: list[AtomicMention], source_text: str,
+    current_draft: dict[str, Any] | None,
+) -> None:
+    append_items = data.setdefault("append_items", {})
+    remove_items = data.setdefault("remove_items", {})
+    clear_fields = data.setdefault("clear_fields", [])
+    set_fields = data.setdefault("set_fields", {})
+    set_sources = data.setdefault("set_sources", {})
+    current = current_draft or {}
+    current_range = (
+        current.get("experience_min_months"), current.get("experience_max_months"),
+    )
+    patch_range = (
+        set_fields.get("experience_min_months"), set_fields.get("experience_max_months"),
+    )
+    hard_range = current_range if any(item is not None for item in current_range) else patch_range
+    hard_requirements = current.get("requirements_json") or []
+
+    for mention in mentions:
+        if mention.field != "requirements_json" or mention.operation != "append":
+            continue
+        target = _REQUIREMENT_MODALITY_FIELDS[mention.modality]
+        values = mention.items or ([] if mention.value is None else [str(mention.value)])
+        values = [
+            value
+            for item in values
+            if (value := _canonical_requirement_text(item))
+        ]
+        for value in values:
+            for field in _REQUIREMENT_MODALITY_FIELDS.values():
+                if field == target:
+                    continue
+                remove_items.setdefault(field, []).append(value)
+                append_items[field] = [
+                    item
+                    for item in append_items.get(field, [])
+                    if _canonical_requirement_text(item["value"]) != value
+                ]
+            target_range = parse_experience_range(value) if re.search(r"经验|年限", value) else None
+            reclassifies_existing = (
+                mention.source == "contextual"
+                or _CORRECTION_SIGNAL_RE.search(source_text) is not None
+            )
+            if mention.modality != "required" and target_range and reclassifies_existing:
+                experience_requirements = [
+                    requirement for requirement in hard_requirements
+                    if parse_experience_range(requirement) is not None
+                ]
+                if (
+                    not experience_ranges_equivalent_for_reclassification(
+                        hard_range, target_range,
+                    )
+                    or (
+                        experience_requirements
+                        and not any(
+                            _same_experience_requirement(requirement, value)
+                            for requirement in experience_requirements
+                        )
+                    )
+                ):
+                    continue
+                for field in ("experience_min_months", "experience_max_months"):
+                    set_fields.pop(field, None)
+                    set_sources.pop(field, None)
+                    clear_fields.append(field)
+
+    data["append_items"] = {
+        field: items for field, items in append_items.items() if items
+    }
+    data["remove_items"] = {
+        field: list(dict.fromkeys(items))
+        for field, items in remove_items.items() if items
+    }
+    data["clear_fields"] = list(dict.fromkeys(clear_fields))
 
 
 def _is_canonicalized_requirement(value: str) -> bool:
@@ -315,9 +558,12 @@ def _is_canonicalized_requirement(value: str) -> bool:
 
 def normalize_patch(
     patch: DraftPatch, source_text: str, mentions: list[AtomicMention] | None = None,
+    current_draft: dict[str, Any] | None = None,
 ) -> DraftPatch:
     data = patch.model_dump(mode="python")
-    _merge_mentions(data, mentions or [])
+    atomic_mentions = mentions or []
+    _merge_mentions(data, atomic_mentions)
+    _normalize_requirement_patch_items(data)
     set_fields = data.setdefault("set_fields", {})
     set_sources = data.setdefault("set_sources", {})
 
@@ -343,9 +589,44 @@ def normalize_patch(
         set_fields[field] = value
         set_sources[field] = "normalized"
 
+    required_experience = (
+        parse_required_experience_range(source_text)
+        if has_experience_context(source_text)
+        else None
+    )
+    if required_experience is not None and required_experience[1] is None:
+        set_fields.pop("experience_max_months", None)
+        set_sources.pop("experience_max_months", None)
+        data.setdefault("clear_fields", []).append("experience_max_months")
+
+    # Requirement modality is the final semantic authority. Apply migrations
+    # after scalar parsing so an older hard-condition source cannot re-add a
+    # value that the user's latest correction moved to preferred/not-required.
+    _apply_requirement_modality_migrations(
+        data, atomic_mentions, source_text, current_draft,
+    )
+    for mention in atomic_mentions:
+        if mention.operation != "remove" or mention.field in JSON_FIELDS:
+            continue
+        set_fields.pop(mention.field, None)
+        set_sources.pop(mention.field, None)
+        data.setdefault("clear_fields", []).append(mention.field)
+    data["clear_fields"] = list(dict.fromkeys(data.get("clear_fields", [])))
+
     for field, items in data.get("append_items", {}).items():
         data["append_items"][field] = [
-            PatchItem(value=clean_markdown(item["value"]), source=item["source"]).model_dump()
+            PatchItem(
+                value=(
+                    _canonical_requirement_text(item["value"])
+                    if field in _REQUIREMENT_MODALITY_FIELDS.values()
+                    else (
+                        _canonical_responsibility_text(item["value"])
+                        if field == "responsibilities_json"
+                        else clean_markdown(item["value"])
+                    )
+                ),
+                source=item["source"],
+            ).model_dump()
             for item in items
             if field != "requirements_json" or not _is_canonicalized_requirement(item["value"])
         ]

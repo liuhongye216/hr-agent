@@ -7,30 +7,56 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 BUSINESS_COLUMNS = (
-    "job_id", "title", "company_name", "city", "work_address",
+    "job_id", "title", "company_name", "department", "job_category", "headcount",
+    "city", "work_address", "work_locations_json",
     "salary_min", "salary_max", "salary_currency", "salary_period",
     "recruitment", "employment", "work_mode", "education_min_level",
     "experience_min_months", "experience_max_months", "requirements_json",
     "responsibilities_json", "skills_json", "certificates_json", "benefits_json",
     "preferred_requirements_json", "not_required_requirements_json",
-    "student_status_json", "internship_min_months", "onsite_days_per_week",
+    "student_status_json", "major_requirements_json", "graduation_years_json",
+    "recruitment_batch", "application_deadline", "internship_min_months",
+    "onsite_days_per_week",
     "source_url", "scraped_at", "content_hash", "extraction_mode",
 )
 
 JSON_FIELDS = frozenset({
     "requirements_json", "responsibilities_json", "skills_json",
     "certificates_json", "benefits_json", "preferred_requirements_json",
-    "not_required_requirements_json", "student_status_json",
+    "not_required_requirements_json", "student_status_json", "major_requirements_json",
+    "graduation_years_json", "work_locations_json",
 })
 SYSTEM_FIELDS = frozenset({"job_id", "scraped_at", "content_hash", "extraction_mode"})
 EDITABLE_FIELDS = tuple(column for column in BUSINESS_COLUMNS if column not in SYSTEM_FIELDS)
 SCALAR_FIELDS = frozenset(set(EDITABLE_FIELDS) - JSON_FIELDS)
 REQUIRED_CREATE_FIELDS = ("company_name", "title")
-CREATE_CONTENT_FIELDS = ("requirements_json", "responsibilities_json")
+CREATE_REQUIREMENT_FIELDS = (
+    "requirements_json", "preferred_requirements_json", "not_required_requirements_json",
+    "skills_json", "certificates_json", "education_min_level", "experience_min_months",
+    "experience_max_months", "student_status_json", "major_requirements_json",
+    "graduation_years_json", "internship_min_months",
+    "onsite_days_per_week",
+)
+CREATE_CONTENT_FIELDS = ("responsibilities_json", *CREATE_REQUIREMENT_FIELDS)
+
+
+def has_meaningful_value(value: Any) -> bool:
+    if value is None or value == "":
+        return False
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def has_create_content(fields: dict[str, Any]) -> bool:
+    return any(has_meaningful_value(fields.get(field)) for field in CREATE_CONTENT_FIELDS)
+
 
 FIELD_LABELS = {
     "job_id": "岗位编号", "title": "岗位名称", "company_name": "公司名称",
+    "department": "部门", "job_category": "岗位类别", "headcount": "招聘人数",
     "city": "城市", "work_address": "工作地址", "salary_min": "最低薪资",
+    "work_locations_json": "工作地点列表",
     "salary_max": "最高薪资", "salary_currency": "薪资币种",
     "salary_period": "薪资周期", "recruitment": "招聘类型",
     "employment": "用工类型", "work_mode": "办公模式",
@@ -39,7 +65,10 @@ FIELD_LABELS = {
     "responsibilities_json": "岗位职责", "skills_json": "技能要求",
     "certificates_json": "证书", "benefits_json": "福利", "source_url": "来源链接",
     "preferred_requirements_json": "加分项", "not_required_requirements_json": "非必需条件",
-    "student_status_json": "学籍状态", "internship_min_months": "最短实习期（月）",
+    "student_status_json": "学籍状态", "major_requirements_json": "专业要求",
+    "graduation_years_json": "毕业届别", "recruitment_batch": "招聘批次",
+    "application_deadline": "投递截止时间",
+    "internship_min_months": "最短实习期（月）",
     "onsite_days_per_week": "每周到岗天数",
     "job_content": "任职要求或岗位职责",
 }
@@ -79,8 +108,12 @@ class JobFields(BaseModel):
 
     title: str | None = None
     company_name: str | None = None
+    department: str | None = None
+    job_category: str | None = None
+    headcount: int | None = Field(default=None, ge=1)
     city: str | None = None
     work_address: str | None = None
+    work_locations_json: list[str] | None = None
     salary_min: float | None = Field(default=None, ge=0)
     salary_max: float | None = Field(default=None, ge=0)
     salary_currency: str | None = None
@@ -96,6 +129,8 @@ class JobFields(BaseModel):
     experience_max_months: int | None = Field(default=None, ge=0)
     internship_min_months: int | None = Field(default=None, ge=0)
     onsite_days_per_week: int | None = Field(default=None, ge=0, le=7)
+    recruitment_batch: str | None = None
+    application_deadline: str | None = None
     requirements_json: list[str] | None = None
     responsibilities_json: list[str] | None = None
     skills_json: list[str] | None = None
@@ -104,6 +139,8 @@ class JobFields(BaseModel):
     preferred_requirements_json: list[str] | None = None
     not_required_requirements_json: list[str] | None = None
     student_status_json: list[str] | None = None
+    major_requirements_json: list[str] | None = None
+    graduation_years_json: list[str] | None = None
     source_url: str | None = None
 
     @field_validator("title", "company_name")
@@ -170,6 +207,7 @@ class ListReplacement(BaseModel):
         "requirements_json", "responsibilities_json", "skills_json",
         "certificates_json", "benefits_json", "preferred_requirements_json",
         "not_required_requirements_json", "student_status_json",
+        "major_requirements_json", "graduation_years_json", "work_locations_json",
     ]
     match: str = Field(min_length=1)
     value: str = Field(min_length=1)
@@ -205,7 +243,8 @@ class AtomicMention(BaseModel):
     def validate_mention(self) -> "AtomicMention":
         if self.field not in EDITABLE_FIELDS:
             raise ValueError(f"atomic mention contains unknown field: {self.field}")
-        if self.value is None and not self.items:
+        scalar_clear = self.operation == "remove" and self.field not in JSON_FIELDS
+        if self.value is None and not self.items and not scalar_clear:
             raise ValueError("atomic mention requires value or items")
         if self.field not in JSON_FIELDS and self.items:
             raise ValueError("scalar atomic mention cannot contain items")
@@ -360,3 +399,9 @@ class ChatResponse(BaseModel):
     unresolved_fragments: list[str] = Field(default_factory=list)
     requested_fields: list[str] = Field(default_factory=list)
     state_version: int = Field(default=0, ge=0)
+    job_id: str | None = None
+    job_profile_version: int | None = Field(default=None, ge=1)
+    lifecycle_status: str | None = None
+    active_question: dict[str, Any] | None = None
+    workflow_trace: list[str] = Field(default_factory=list)
+    conversation_phase: str = "IDLE"
