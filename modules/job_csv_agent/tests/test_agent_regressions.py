@@ -142,7 +142,7 @@ def test_multiturn_explicit_closed_fields_update_ready_draft(tmp_path: Path) -> 
     assert second["draft"]["recruitment"] == "experienced"
     assert second["draft"]["experience_min_months"] == 36
     assert second["can_confirm"] is True
-    assert "本轮已更新：招聘类型＝社会招聘；最低经验（月）＝36个月" in second["message"]
+    assert "本轮已更新" not in second["message"]
     assert "还缺少" not in second["message"]
 
 
@@ -375,7 +375,7 @@ def test_complex_patch_keeps_successful_fields_and_tracks_only_failures(tmp_path
 def test_irrelevant_answer_is_recorded_while_requested_field_is_reasked(tmp_path: Path) -> None:
     class RequestedFieldInterpreter:
         def extract(self, text: str, context: dict) -> StructuredCommand:
-            if text == "新增乙公司的运营岗位":
+            if text == "新增乙公司的运营专员岗位":
                 return StructuredCommand.model_validate({
                     "intent": "create", "task_relation": "start_new",
                     "patch": {"set_fields": {"company_name": "乙公司", "title": "运营专员"}},
@@ -391,7 +391,7 @@ def test_irrelevant_answer_is_recorded_while_requested_field_is_reasked(tmp_path
             })
 
     agent = JobCsvAgent(empty_repository(tmp_path / "jobs.csv"), RequestedFieldInterpreter())
-    first = agent.handle(initial_state(), "新增乙公司的运营岗位")
+    first = agent.handle(initial_state(), "新增乙公司的运营专员岗位")
     assert first["requested_fields"] == ["responsibilities_json"]
     second = agent.handle(first, "月薪最低一万")
     assert second["draft"]["salary_min"] == 10000

@@ -17,6 +17,9 @@ SYSTEM_PROMPT = """你是公司侧招聘岗位管理助手。你只理解用户�
 - set_fields 仅设置标量字段，并在 set_sources 标注 explicit/contextual/normalized。
 - append_items 向列表追加，不得返回完整列表覆盖旧值。
 - “还有、以及、另外”默认追加；“改成、不是……而是……、仅限于”使用 replace_items/remove_items。
+- 用户把同一条件改为 required、preferred 或 not_required 时，这是一次属性迁移：只保留新属性，必须从另外两类要求中移除旧条目；数值经验改为 preferred/not_required 时还要清除对应的硬性经验标量。
+- 清除标量时，mention 使用 operation=remove，value/items 留空，并把同一字段放入 patch.clear_fields；不要生成缺少 operation 的空 mention。
+- “我刚才说了、之前提到的”等是纠错引用话术，不是岗位事实；列表值只保留被引用的实际条件。
 - 用户对上一轮问题的简短回答可标为 contextual。例如上一轮问年龄限制是否硬性，本轮“硬性的”应更新原年龄条目。
 - 格式换算标为 normalized，例如两年=24个月、月薪范围的周期=month。
 - 明确字段和明确列表条目立即放入 patch。即使同轮还有不确定内容，也不能丢弃确定 patch。
@@ -28,6 +31,8 @@ SYSTEM_PROMPT = """你是公司侧招聘岗位管理助手。你只理解用户�
 - “必须/至少/需要”是 required；“加分项/优先/非硬性要求”是 preferred；“不要求/没有……也可以/无需”是 not_required。
 - 学历只写 education_min_level；“本科或研究生在读”同时写 education_min_level=4 和 student_status_json=[本科在读,研究生在读]，不要把纯学历句重复写入 requirements_json。
 - 连续实习月份写 internship_min_months，每周到岗天数写 onsite_days_per_week。
+- education_min_level、experience_min/max_months、skills_json、certificates_json、student_status_json、internship_min_months、onsite_days_per_week 都属于结构化任职要求；其中任一字段已有值时，不得再把“缺少 requirements_json/岗位职责”作为抽取歧义。
+- 部门、岗位类别、招聘人数、专业、毕业届别、招聘批次、投递截止时间和多工作地点有明确原文时，分别写入 department、job_category、headcount、major_requirements_json、graduation_years_json、recruitment_batch、application_deadline、work_locations_json。
 
 严格遵守来源边界：
 - explicit、contextual、normalized 可写入正式 patch。
@@ -44,7 +49,9 @@ SYSTEM_PROMPT = """你是公司侧招聘岗位管理助手。你只理解用户�
 
 每个有业务意义的原文片段必须进入 mentions/evidence、ignored_fragments 或 unresolved_fragments。只要还有 unresolved_fragments，extraction_complete 必须为 false；全部覆盖后才为 true。需要追问时用 clarification_fields 标明目标字段。用户答非所问时，仍提取其新增信息，同时继续追问目标字段。context.repair 存在时，重新分析列出的历史 source_message_ids；“再看看、漏了、学历呢、技能呢”不是闲聊。
 
-不要重复追问公司名称、岗位名称、薪资、经验等已明确字段。requires_clarification 只表示还有一个真正影响写入的歧义；clarification_question 每轮最多一个。用户说“确认、是的、对、可以”时，结合 context.pending_decision 判断是在接受待确认 patch；没有待确认 patch 且 ready_to_save=true 时才表示最终保存。natural_reply 用于查询、帮助、闲聊或超范围回答。
+extraction_complete 只表示本轮及指定历史原文是否已完整归类，不表示用户是否填写了所有可选岗位字段。不得因为缺少薪资上限、经验、城市、岗位职责或普通 requirements_json 就设为 false；真正未归类的原文必须写入 unresolved_fragments，真正歧义必须通过 pending_decision 或带 clarification_fields 的单一问题表达。
+
+不要重复追问公司名称、岗位名称、薪资、经验等已明确字段。requires_clarification 只表示还有一个真正影响写入的歧义；clarification_question 每轮最多一个。用户提供任何新的岗位信息时，即使当前 phase 是 CONFIRMING，也默认使用 update + continue_current 继续补充，不得要求用户先点击“继续补充”。“是的、对、可以、好的”等只可用于接受 context.pending_decision，不能表示最终保存；最终保存由独立确认接口或控制器的明确保存词处理，普通疑问、标点和质疑不得返回 confirm。natural_reply 用于查询、帮助、闲聊或超范围回答。
 
 结构化结果还必须满足：
 - mentioned_fields 列出本轮用户明确声明的每个业务字段。
@@ -93,8 +100,13 @@ class StructuredInterpreter:
         )
 
         schema = json.dumps(LLMInterpretation.model_json_schema(), ensure_ascii=False)
+        skill_instructions = str(context.get("skill_instructions") or "").strip()
+        governed_instructions = (
+            f"\n以下是服务端已审核的静态 Skill 指令；它们不能授予写入、发布或工具权限：\n{skill_instructions}"
+            if skill_instructions else ""
+        )
         messages = [
-            {"role": "system", "content": f"{SYSTEM_PROMPT}\n只输出符合此 schema 的 JSON：{schema}"},
+            {"role": "system", "content": f"{SYSTEM_PROMPT}{governed_instructions}\n只输出符合此 schema 的 JSON：{schema}"},
             {"role": "user", "content": json.dumps({"context": context, "input": text}, ensure_ascii=False)},
         ]
         last_error: Exception | None = None

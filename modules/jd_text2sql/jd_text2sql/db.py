@@ -9,7 +9,10 @@ from typing import Any, Iterable
 from .config import BUSINESS_JOBS_CSV, DEFAULT_DB_PATH
 
 
-INTEGER_COLUMNS = {"education_min_level", "experience_min_months", "experience_max_months"}
+INTEGER_COLUMNS = {
+    "education_min_level", "experience_min_months", "experience_max_months",
+    "headcount", "internship_min_months", "onsite_days_per_week",
+}
 REAL_COLUMNS = {"salary_min", "salary_max"}
 
 

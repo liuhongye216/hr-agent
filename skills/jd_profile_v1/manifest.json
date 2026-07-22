@@ -1,0 +1,10 @@
+{
+  "id": "jd_profile_v1",
+  "version": "1.0.0",
+  "description": "将企业原始 JD 转换为有证据、可确认的岗位画像 Patch。",
+  "applicable_intents": ["create", "update"],
+  "allowed_capabilities": ["interpret_job_text", "validate_job_patch"],
+  "write_permission": false,
+  "confirmation_required": true,
+  "instruction_file": "instructions.md"
+}

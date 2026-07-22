@@ -1,0 +1,10 @@
+{
+  "id": "profile_critic_v1",
+  "version": "1.0.0",
+  "description": "只读审查岗位画像的证据、完整性、冲突和合规风险。",
+  "applicable_intents": ["review"],
+  "allowed_capabilities": ["review_job_profile"],
+  "write_permission": false,
+  "confirmation_required": false,
+  "instruction_file": "instructions.md"
+}

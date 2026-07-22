@@ -36,6 +36,10 @@ async def _render(payload: dict[str, Any]) -> None:
         ])
     if payload.get("can_cancel"):
         actions.append(cl.Action(name="cancel_operation", label="取消", payload={"value": "cancel"}))
+    if payload.get("lifecycle_status") == "REVIEWED" and payload.get("job_id"):
+        actions.append(cl.Action(name="publish_job", label="发布岗位", payload={"value": "publish"}))
+    if payload.get("lifecycle_status") == "PUBLISHED" and payload.get("job_id"):
+        actions.append(cl.Action(name="close_job", label="关闭岗位", payload={"value": "close"}))
     if payload.get("phase") == "EDITING":
         for index, row in enumerate(payload.get("candidates", []), 1):
             actions.append(cl.Action(
@@ -57,7 +61,7 @@ async def _safe_call(method: str, path: str, **kwargs: Any) -> None:
                 request_json = dict(kwargs.get("json", {}))
                 request_json["expected_version"] = version
                 kwargs["json"] = request_json
-            elif any(token in path for token in ("/confirm", "/cancel", "/select/")):
+            elif any(token in path for token in ("/confirm", "/cancel", "/select/", "/publish", "/close")):
                 separator = "&" if "?" in path else "?"
                 path = f"{path}{separator}expected_version={version}"
             payload = await _request(method, path, **kwargs)
@@ -121,3 +125,13 @@ async def cancel_operation(_: cl.Action) -> None:
 async def select_job(action: cl.Action) -> None:
     index = int(action.payload["index"])
     await _safe_call("POST", f"/sessions/{_session_id()}/select/{index}")
+
+
+@cl.action_callback("publish_job")
+async def publish_job(_: cl.Action) -> None:
+    await _safe_call("POST", f"/sessions/{_session_id()}/publish")
+
+
+@cl.action_callback("close_job")
+async def close_job(_: cl.Action) -> None:
+    await _safe_call("POST", f"/sessions/{_session_id()}/close")

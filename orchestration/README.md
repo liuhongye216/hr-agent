@@ -1,31 +1,20 @@
-# 工作流编排（占位）
+# 工作流编排
 
-该目录将实现公司侧 Agent 的确定性状态机，不在这里重复实现抽取、写库或检索逻辑。
+编排已实现于 `modules/job_csv_agent/job_csv_agent/workflow.py` 和 `enterprise_agent.py`。
 
-建议状态：
-
-```text
-DRAFT
-→ EXTRACTED
-→ NEEDS_CLARIFICATION
-→ PENDING_CONFIRMATION
-→ ACTIVE
-→ CLOSED
-```
-
-建议主流程：
+当前显式图：
 
 ```text
-接收输入
-→ 意图识别
-→ JD 抽取/读取现有岗位
-→ 完整性与冲突检测
-→ 追问循环
-→ 生成字段 Patch
-→ 差异预览和确认
-→ 保存岗位版本
-→ 发布检索请求
-→ 返回匹配解释
+authorize
+→ select_skills
+→ route_lifecycle
+   ├─ publish / close / history → END
+   └─ 普通岗位对话
+      → invoke_job_capability
+      → attach_quality_status
+      → END
 ```
 
-编排状态至少应记录 `session_id`、`company_id`、`operator_id`、`intent`、`job_id`、`job_profile_version`、缺失字段、冲突、待问问题、待确认 Patch 和工具执行结果。
+每次运行限制最大节点数并保存节点轨迹、耗时、完成状态和错误类型。人工确认仍由独立 API 和会话版本控制，不由模型输出触发。
+
+原 `JobCsvAgent.handle()` 现在是岗位编辑 Capability 内部控制器；跨身份、Skill、生命周期、质量门和观测的编排全部位于企业 Agent 图中。

@@ -1,20 +1,20 @@
 # JD → CSV → Text2SQL
 
-这是公司侧 Agent 中的轻量 JD 数据准备与查询模块。数据不存放在模块内部，统一归属 `company_agent/data`。
+这是公司侧 Agent 中的轻量 JD 数据准备与查询模块。数据不存放在模块内部，统一归属 `hr-agent/data`。
 
 ## 唯一数据流
 
 ```text
-company_agent/data/source/jobs.jsonl
+hr-agent/data/source/jobs.jsonl
         │ 纯规则：展开 JSON 顶层字段，嵌套值编码为 JSON
         ▼
-company_agent/data/source/jobs.csv
+hr-agent/data/source/jobs.csv
         │ 规则处理标量；DeepSeek 可选补充长文本抽取
         ▼
-company_agent/data/business/jobs.csv
+hr-agent/data/business/jobs.csv
         │ 一张业务表加载到可重建 SQLite
         ▼
-company_agent/runtime/jd_text2sql.sqlite
+hr-agent/runtime/jd_text2sql.sqlite
 ```
 
 数据层只有三份正式文件：
@@ -28,7 +28,7 @@ company_agent/runtime/jd_text2sql.sqlite
 ## 两阶段准备
 
 ```powershell
-cd company_agent\modules\jd_text2sql
+cd hr-agent\modules\jd_text2sql
 python -m pip install -r requirements-dev.txt
 
 # 第一步：JSONL → 源 CSV，始终是确定性规则
@@ -63,7 +63,7 @@ SQLite 只包含 `jobs` 一张业务表和内部元数据表。`requirements_jso
 
 ## DeepSeek 配置
 
-在 `company_agent/.env`（或模块本地 `.env`）中配置：
+在 `hr-agent/.env`（或模块本地 `.env`）中配置：
 
 ```dotenv
 DEEPSEEK_API_KEY=...

@@ -15,8 +15,8 @@ import pandas as pd
 import portalocker
 
 from .schemas import (
-    BUSINESS_COLUMNS, CREATE_CONTENT_FIELDS, EDITABLE_FIELDS, JSON_FIELDS, JobFields,
-    REQUIRED_CREATE_FIELDS,
+    BUSINESS_COLUMNS, EDITABLE_FIELDS, JSON_FIELDS, JobFields, REQUIRED_CREATE_FIELDS,
+    has_create_content,
 )
 
 
@@ -105,7 +105,7 @@ class CsvJobRepository:
         missing = [key for key in required_fields if not payload.get(key)]
         if missing:
             raise ValueError(f"岗位不能缺少必填字段：{', '.join(missing)}")
-        if require_job_content and not any(payload.get(key) for key in CREATE_CONTENT_FIELDS):
+        if require_job_content and not has_create_content(payload):
             raise ValueError("岗位至少需要一项任职要求、岗位职责或可抽取的完整 JD 内容")
 
     def get(self, job_id: str) -> dict[str, str]:
@@ -115,12 +115,17 @@ class CsvJobRepository:
                 raise JobNotFoundError(job_id)
             return matches.iloc[0].to_dict()
 
+    def list_all(self) -> list[dict[str, str]]:
+        """Compatibility export used to bootstrap the governed control plane."""
+        with self._locked_frame() as frame:
+            return frame.to_dict(orient="records")
+
     def create(self, fields: dict[str, Any]) -> dict[str, str]:
         validated = JobFields.model_validate(fields).model_dump(exclude_none=True)
         missing = [key for key in REQUIRED_CREATE_FIELDS if not validated.get(key)]
         if missing:
             raise ValueError(f"新建岗位缺少必填字段：{', '.join(missing)}")
-        if not any(validated.get(key) for key in CREATE_CONTENT_FIELDS):
+        if not has_create_content(validated):
             raise ValueError("新建岗位至少需要一项任职要求、岗位职责或可抽取的完整 JD 内容")
         values = self._serialize_fields(validated)
         with self._locked_frame() as frame:
@@ -219,14 +224,16 @@ class CsvJobRepository:
 
     def get_public_detail(self, job_id: str) -> dict[str, Any]:
         public_fields = (
-            "job_id", "company_name", "title", "city", "work_address",
+            "job_id", "company_name", "title", "department", "job_category", "headcount",
+            "city", "work_address", "work_locations_json",
             "salary_min", "salary_max", "salary_currency", "salary_period",
             "recruitment", "employment", "work_mode", "education_min_level",
             "experience_min_months", "experience_max_months", "requirements_json",
             "responsibilities_json", "skills_json", "certificates_json", "benefits_json",
             "preferred_requirements_json", "not_required_requirements_json",
             "student_status_json", "internship_min_months", "onsite_days_per_week",
-            "source_url",
+            "major_requirements_json", "graduation_years_json", "recruitment_batch",
+            "application_deadline", "source_url",
         )
         row = self.get(job_id)
         detail: dict[str, Any] = {}

@@ -3,6 +3,7 @@
 !.env.example
 **/__pycache__/
 **/.pytest_cache/
+.pytest_tmp/
 **/.chainlit/
 **/.files/
 **/.venv/
